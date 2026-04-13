@@ -2,8 +2,6 @@ package core
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"net/http"
 	"time"
@@ -76,8 +74,23 @@ func (s *Server) Shutdown(ctx context.Context, finalMessage ...[]byte) {
 }
 
 // HandleHTTP is a convenience net/http handler that extracts the connection ID
-// using the configured ConnIDExtractor and upgrades to WebSocket.
+// using the configured ConnIDExtractor (or OnUpgrade hook) and upgrades to WebSocket.
 func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
+	// If OnUpgrade is configured, it replaces authenticator + connIDExtractor.
+	if s.opts.onUpgrade != nil {
+		info, err := s.opts.onUpgrade(r)
+		if err != nil {
+			jsonError(w, err.Error(), http.StatusUnauthorized)
+			return
+		}
+		if info == nil || info.ConnID == "" {
+			jsonError(w, "connection id is required", http.StatusBadRequest)
+			return
+		}
+		s.upgrade(w, r, info.ConnID, nil, info.Metadata)
+		return
+	}
+
 	if s.opts.connIDExtractor == nil {
 		jsonError(w, "connIDExtractor not configured; use Upgrade() or set WithConnIDExtractor", http.StatusInternalServerError)
 		return
@@ -89,7 +102,7 @@ func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.upgrade(w, r, connID, nil)
+	s.upgrade(w, r, connID, nil, nil)
 }
 
 // Upgrade handles the WebSocket upgrade from any HTTP handler.
@@ -108,12 +121,31 @@ func (s *Server) Upgrade(w http.ResponseWriter, r *http.Request, connID string, 
 		}
 	}
 
-	s.upgrade(w, r, connID, uo)
+	s.upgrade(w, r, connID, uo, nil)
+}
+
+// UpgradeWithMeta handles the WebSocket upgrade with additional metadata to inject.
+// connID must be pre-extracted by the caller.
+func (s *Server) UpgradeWithMeta(w http.ResponseWriter, r *http.Request, connID string, metadata map[string]interface{}, opts ...UpgradeOption) {
+	if connID == "" {
+		jsonError(w, "connection id is required", http.StatusBadRequest)
+		return
+	}
+
+	var uo *upgradeOpts
+	if len(opts) > 0 {
+		uo = &upgradeOpts{}
+		for _, fn := range opts {
+			fn(uo)
+		}
+	}
+
+	s.upgrade(w, r, connID, uo, metadata)
 }
 
 // upgrade is the shared implementation.
-func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, connID string, uo *upgradeOpts) {
-	// ── 1. Pre-check connection limit ───────────────────────────────────────
+func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, connID string, uo *upgradeOpts, metadata map[string]interface{}) {
+	// ── 1. Pre-check connection limit
 	if s.opts.maxConnections > 0 &&
 		s.hub.ConnCount() >= int(s.opts.maxConnections) &&
 		s.hub.GetConn(connID) == nil {
@@ -121,7 +153,7 @@ func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, connID string, 
 		return
 	}
 
-	// ── 2. Authentication ───────────────────────────────────────────────────
+	// ── 2. Authentication
 	if s.opts.authenticator != nil {
 		if err := s.opts.authenticator(r); err != nil {
 			jsonError(w, err.Error(), http.StatusUnauthorized)
@@ -129,7 +161,7 @@ func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, connID string, 
 		}
 	}
 
-	// ── 3. WebSocket upgrade ────────────────────────────────────────────────
+	// ── 3. WebSocket upgrade
 	acceptOpts := &websocket.AcceptOptions{
 		InsecureSkipVerify: s.opts.insecureSkipVerify,
 	}
@@ -142,7 +174,7 @@ func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, connID string, 
 	}
 	wsConn.SetReadLimit(s.opts.maxMessageSize)
 
-	// ── 4. Token handling ───────────────────────────────────────────────────
+	// ── 4. Token handling
 	ctx := r.Context()
 
 	// Resolve token: explicit UpgradeOption > query string fallback.
@@ -169,13 +201,9 @@ func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, connID string, 
 				return
 			}
 		}
-	} else {
-		if tok == "" {
-			tok = generateRandomTokenLocal()
-		}
 	}
 
-	// ── 5. Create connection ────────────────────────────────────────────────
+	// ── 5. Create connection
 	var limiter *rate.Limiter
 	if s.opts.rateLimitPerSec > 0 {
 		limiter = rate.NewLimiter(rate.Limit(s.opts.rateLimitPerSec), s.opts.rateLimitBurst)
@@ -183,13 +211,27 @@ func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, connID string, 
 	conn := NewConn(connID, tok, wsConn, s.opts.sendChannelSize, limiter)
 	conn.setReconnect(isReconnect)
 
-	// ── 6. Fire OnConnect BEFORE registering in Hub ─────────────────────────
-	if err := s.safeOnConnect(ctx, conn); err != nil {
+	// Snapshot HTTP request info so OnConnect can access query params, headers, etc.
+	conn.info = &ConnInfo{
+		RemoteAddr: r.RemoteAddr,
+		Header:     r.Header.Clone(),
+		Query:      r.URL.Query(),
+	}
+
+	// Inject metadata from OnUpgrade or UpgradeWithMeta.
+	if metadata != nil {
+		for k, v := range metadata {
+			conn.Set(k, v)
+		}
+	}
+
+	// ── 6. Fire OnConnect BEFORE registering in Hub
+	if err := s.onConnect(ctx, conn); err != nil {
 		_ = wsConn.Close(websocket.StatusPolicyViolation, err.Error())
 		return
 	}
 
-	// ── 7. Register in Hub (replaces old conn, flushes pending) ─────────────
+	// ── 7. Register in Hub (replaces old conn, flushes pending)
 	if err := s.hub.register(ctx, conn); err != nil {
 		_ = wsConn.Close(websocket.StatusTryAgainLater, err.Error())
 		return
@@ -199,7 +241,7 @@ func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, connID string, 
 		s.metrics.IncReconnects()
 	}
 
-	// ── 8. Start pumps ─────────────────────────────────────────────────────
+	// ── 8. Start pumps
 	s.wg.Add(2)
 	go s.writePump(ctx, conn)
 	s.readPump(ctx, conn) // blocks
@@ -218,7 +260,7 @@ func (s *Server) readPump(ctx context.Context, c *Conn) {
 		removed := s.hub.unregister(c)
 		c.Finish()
 		c.CloseNow()
-		s.safeOnDisconnect(ctx, c)
+		s.onDisconnect(ctx, c)
 
 		if removed && s.opts.tokenProvider != nil {
 			_ = s.opts.tokenProvider.Revoke(context.Background(), c.ID())
@@ -230,7 +272,7 @@ func (s *Server) readPump(ctx context.Context, c *Conn) {
 		if err != nil {
 			if websocket.CloseStatus(err) != websocket.StatusNormalClosure &&
 				websocket.CloseStatus(err) != websocket.StatusGoingAway {
-				s.safeOnError(ctx, c, err)
+				s.onError(ctx, c, err)
 				s.metrics.IncErrors()
 			}
 			return
@@ -239,7 +281,7 @@ func (s *Server) readPump(ctx context.Context, c *Conn) {
 		s.metrics.IncMessagesIn()
 
 		if !c.AllowMessage() {
-			s.safeOnError(ctx, c, ErrRateLimited)
+			s.onError(ctx, c, ErrRateLimited)
 			continue
 		}
 
@@ -247,8 +289,8 @@ func (s *Server) readPump(ctx context.Context, c *Conn) {
 		msg := &Message{Raw: data}
 		msg.Type = s.parser.ParseType(data)
 
-		if err := s.safeOnMessage(ctx, c, msg); err != nil {
-			s.safeOnError(ctx, c, err)
+		if err := s.onMessage(ctx, c, msg); err != nil {
+			s.onError(ctx, c, err)
 			s.metrics.IncErrors()
 		}
 	}
@@ -324,7 +366,7 @@ func (s *Server) drainToPending(c *Conn) {
 
 // ── Panic-safe event handler wrappers ──────────────────────────────────────
 
-func (s *Server) safeOnConnect(ctx context.Context, c *Conn) (err error) {
+func (s *Server) onConnect(ctx context.Context, c *Conn) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("OnConnect panic: %v", r)
@@ -335,7 +377,7 @@ func (s *Server) safeOnConnect(ctx context.Context, c *Conn) (err error) {
 	return s.handler.OnConnect(ctx, c)
 }
 
-func (s *Server) safeOnMessage(ctx context.Context, c *Conn, msg *Message) (err error) {
+func (s *Server) onMessage(ctx context.Context, c *Conn, msg *Message) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("OnMessage panic: %v", r)
@@ -345,7 +387,7 @@ func (s *Server) safeOnMessage(ctx context.Context, c *Conn, msg *Message) (err 
 	return s.handler.OnMessage(ctx, c, msg)
 }
 
-func (s *Server) safeOnDisconnect(ctx context.Context, c *Conn) {
+func (s *Server) onDisconnect(ctx context.Context, c *Conn) {
 	defer func() {
 		if r := recover(); r != nil {
 			s.opts.logger.Error("panic in OnDisconnect", "connID", c.ID(), "panic", r)
@@ -355,7 +397,7 @@ func (s *Server) safeOnDisconnect(ctx context.Context, c *Conn) {
 	s.handler.OnDisconnect(ctx, c)
 }
 
-func (s *Server) safeOnError(ctx context.Context, c *Conn, err error) {
+func (s *Server) onError(ctx context.Context, c *Conn, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			s.opts.logger.Error("panic in OnError", "connID", c.ID(), "panic", r)
@@ -363,12 +405,3 @@ func (s *Server) safeOnError(ctx context.Context, c *Conn, err error) {
 	}()
 	s.handler.OnError(ctx, c, err)
 }
-
-// generateRandomTokenLocal produces a cryptographically random token for the server package
-func generateRandomTokenLocal() string {
-	b := make([]byte, 16)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
-}
-
-

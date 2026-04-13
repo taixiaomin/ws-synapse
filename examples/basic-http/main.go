@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"log/slog"
 	"net/http"
@@ -13,11 +14,11 @@ import (
 
 // MyHandler implements ws.EventHandler
 type MyHandler struct {
-	hub *ws.Hub
+	// No longer needs a hub field — use conn.Hub() directly.
 }
 
 func (h *MyHandler) OnConnect(ctx context.Context, conn *ws.Conn) error {
-	log.Printf("Client connected: %s (reconnect: %v)", conn.ID(), conn.IsReconnect())
+	log.Printf("Client connected: %s (reconnect: %v, ip: %s)", conn.ID(), conn.IsReconnect(), conn.RemoteAddr())
 	return conn.SendJSON(map[string]interface{}{
 		"type":  "welcome",
 		"token": conn.Token(),
@@ -38,7 +39,7 @@ func (h *MyHandler) OnMessage(ctx context.Context, conn *ws.Conn, msg *ws.Messag
 		if !ok {
 			return conn.SendJSON(map[string]string{"error": "missing topic"})
 		}
-		h.hub.Subscribe(ctx, conn.ID(), topic)
+		conn.Hub().Subscribe(ctx, conn.ID(), topic)
 		return conn.SendJSON(map[string]string{"status": "subscribed", "topic": topic})
 
 	case "ping":
@@ -70,7 +71,7 @@ func main() {
 	// Create event handler
 	handler := &MyHandler{}
 
-	// Create server with options
+	// Create server with options — use WithOnUpgrade for unified auth + connID extraction
 	server := ws.NewServer(handler,
 		ws.WithTokenProvider(ws.NewMemoryTokenProvider()),
 		ws.WithPingInterval(30*time.Second),
@@ -78,19 +79,25 @@ func main() {
 		ws.WithRateLimit(100, 20),
 		ws.WithInsecureSkipVerify(true), // dev only!
 		ws.WithLogger(ws.NewSlogAdapter(slog.Default())),
+		ws.WithOnUpgrade(func(r *http.Request) (*ws.UpgradeInfo, error) {
+			connID := r.URL.Query().Get("id")
+			if connID == "" {
+				return nil, fmt.Errorf("missing id")
+			}
+			return &ws.UpgradeInfo{
+				ConnID: connID,
+				Metadata: map[string]interface{}{
+					"role": r.URL.Query().Get("role"),
+				},
+			}, nil
+		}),
 	)
-
-	// Inject Hub reference so handler can use it
-	handler.hub = server.Hub()
 
 	// Setup HTTP routes
 	mux := http.NewServeMux()
 
-	// WebSocket endpoint
-	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		connID := r.URL.Query().Get("id")
-		server.Upgrade(w, r, connID)
-	})
+	// WebSocket endpoint — use HandleHTTP which calls the OnUpgrade hook
+	mux.HandleFunc("/ws", server.HandleHTTP)
 
 	// Health check endpoint
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {

@@ -4,12 +4,22 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/coder/websocket"
 	"golang.org/x/time/rate"
 )
+
+// ConnInfo holds a snapshot of the HTTP request at WebSocket handshake time (read-only).
+type ConnInfo struct {
+	RemoteAddr string
+	Header     http.Header
+	Query      url.Values
+}
 
 // ErrSendChannelFull is returned when the outbound channel is full.
 var ErrSendChannelFull = errors.New("ws: send channel full")
@@ -35,6 +45,9 @@ type Conn struct {
 	done        chan struct{} // closed when the connection lifecycle ends
 	isReconnect bool          // true if connection was established via token reconnect
 	limiter     *rate.Limiter // per-connection inbound rate limiter; nil = unlimited
+
+	hub  *Hub      // back-reference injected by Hub.register()
+	info *ConnInfo // HTTP handshake snapshot; nil if not set
 }
 
 func NewConn(id, token string, ws *websocket.Conn, chSize int, limiter *rate.Limiter) *Conn {
@@ -57,6 +70,75 @@ func (c *Conn) Token() string { return c.token }
 
 // IsReconnect reports whether this connection was established via a reconnect token.
 func (c *Conn) IsReconnect() bool { return c.isReconnect }
+
+// Hub returns the Hub that this connection is registered with.
+// Available after the connection is registered (i.e., inside OnConnect and later callbacks).
+func (c *Conn) Hub() *Hub { return c.hub }
+
+// RemoteAddr returns the client address, preferring X-Forwarded-For if present.
+func (c *Conn) RemoteAddr() string {
+	if c.info == nil {
+		return ""
+	}
+	if xff := c.info.Header.Get("X-Forwarded-For"); xff != "" {
+		return strings.TrimSpace(strings.SplitN(xff, ",", 2)[0])
+	}
+	return c.info.RemoteAddr
+}
+
+// Header returns the value of the specified HTTP header from the handshake request.
+func (c *Conn) Header(key string) string {
+	if c.info == nil {
+		return ""
+	}
+	return c.info.Header.Get(key)
+}
+
+// Query returns the value of the specified URL query parameter from the handshake request.
+func (c *Conn) Query(key string) string {
+	if c.info == nil {
+		return ""
+	}
+	return c.info.Query.Get(key)
+}
+
+// QueryValues returns the complete URL query parameters from the handshake request.
+func (c *Conn) QueryValues() url.Values {
+	if c.info == nil {
+		return nil
+	}
+	return c.info.Query
+}
+
+// GetString retrieves a metadata value by key and asserts it to string.
+func (c *Conn) GetString(key string) (string, bool) {
+	v, ok := c.meta.Load(key)
+	if !ok {
+		return "", false
+	}
+	s, ok := v.(string)
+	return s, ok
+}
+
+// GetInt64 retrieves a metadata value by key and asserts it to int64.
+func (c *Conn) GetInt64(key string) (int64, bool) {
+	v, ok := c.meta.Load(key)
+	if !ok {
+		return 0, false
+	}
+	i, ok := v.(int64)
+	return i, ok
+}
+
+// GetBool retrieves a metadata value by key and asserts it to bool.
+func (c *Conn) GetBool(key string) (bool, bool) {
+	v, ok := c.meta.Load(key)
+	if !ok {
+		return false, false
+	}
+	b, ok := v.(bool)
+	return b, ok
+}
 
 // setReconnect sets the reconnect flag (internal use).
 func (c *Conn) setReconnect(reconnect bool) { c.isReconnect = reconnect }

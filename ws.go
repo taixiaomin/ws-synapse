@@ -11,15 +11,18 @@ import (
 
 // ── Re-export all public types and functions from core ──
 
-// Core types
+// Conn Core types
 type Conn = core.Conn
+type ConnInfo = core.ConnInfo
 type Hub = core.Hub
 type Message = core.Message
 type MessageEnvelope = core.MessageEnvelope
 type Server = core.Server
 type ServerOption = core.ServerOption
+type UpgradeInfo = core.UpgradeInfo
+type PreparedMessage = core.PreparedMessage
 
-// Interfaces
+// EventHandler Interfaces
 type EventHandler = core.EventHandler
 type TopicEventHandler = core.TopicEventHandler
 type MessageParser = core.MessageParser
@@ -28,27 +31,29 @@ type MetricsCollector = core.MetricsCollector
 type PendingStore = core.PendingStore
 type TokenProvider = core.TokenProvider
 
-// Logger Implementations
+// NopLogger Logger Implementations
 type NopLogger = core.NopLogger
 
-// Token Provider
+// MemoryTokenProvider Token Provider
 type MemoryTokenProvider = token.MemoryTokenProvider
 
 // ── Errors ──
 var (
-	ErrSendChannelFull   = core.ErrSendChannelFull
-	ErrMaxConnsReached   = core.ErrMaxConnsReached
-	ErrMessageDropped    = core.ErrMessageDropped
-	ErrRateLimited       = core.ErrRateLimited
+	ErrSendChannelFull = core.ErrSendChannelFull
+	ErrMaxConnsReached = core.ErrMaxConnsReached
+	ErrMessageDropped  = core.ErrMessageDropped
+	ErrRateLimited     = core.ErrRateLimited
 )
 
 // ── Constructors ──
 var (
-	NewHub                = core.NewHub
-	NewConn               = core.NewConn
-	NewServer             = core.NewServer
-	NewSlogAdapter        = core.NewSlogAdapter
-	NewMemoryTokenProvider = token.NewMemoryTokenProvider
+	NewHub                      = core.NewHub
+	NewConn                     = core.NewConn
+	NewServer                   = core.NewServer
+	NewSlogAdapter              = core.NewSlogAdapter
+	NewMemoryTokenProvider      = token.NewMemoryTokenProvider
+	NewPreparedMessage          = core.NewPreparedMessage
+	NewPreparedMessageFromBytes = core.NewPreparedMessageFromBytes
 )
 
 // ── Hub Options ──
@@ -73,6 +78,7 @@ var (
 	WithMaxMessageSize     = core.WithMaxMessageSize
 	WithAuthenticator      = core.WithAuthenticator
 	WithConnIDExtractor    = core.WithConnIDExtractor
+	WithOnUpgrade          = core.WithOnUpgrade
 	WithMaxConnections     = core.WithMaxConnections
 	WithRateLimit          = core.WithRateLimit
 	WithTokenProvider      = core.WithTokenProvider
@@ -83,9 +89,7 @@ var (
 	WithReconnectToken     = core.WithReconnectToken
 )
 
-// ── Token ──
+// GenerateRandomToken ── Token ──
 var (
 	GenerateRandomToken = token.GenerateRandomToken
 )
-
-

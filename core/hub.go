@@ -88,6 +88,9 @@ func NewHub(opts ...HubOption) *Hub {
 // register adds or replaces a connection and flushes any pending messages.
 // Returns ErrMaxConnsReached if the connection limit has been exceeded.
 func (h *Hub) register(ctx context.Context, c *Conn) error {
+	// Inject Hub reference so Conn.Hub() works in callbacks.
+	c.hub = h
+
 	old, replacing := h.conns.LoadAndDelete(c.id)
 	if replacing {
 		o := old.(*Conn)
@@ -198,6 +201,68 @@ func (h *Hub) BroadcastJSON(ctx context.Context, topic string, v interface{}) {
 		return
 	}
 	h.Broadcast(ctx, topic, data)
+}
+
+// BroadcastExclude sends raw bytes to every connection subscribed to a topic,
+// but skips the specified connection IDs. This is equivalent to Socket.IO's
+// socket.to(room).emit() which excludes the sender.
+func (h *Hub) BroadcastExclude(ctx context.Context, topic string, data []byte, excludeIDs ...string) {
+	h.mu.RLock()
+	subs, ok := h.topics[topic]
+	if !ok {
+		h.mu.RUnlock()
+		return
+	}
+	ids := make([]string, 0, len(subs))
+	for id := range subs {
+		ids = append(ids, id)
+	}
+	h.mu.RUnlock()
+
+	excludeSet := make(map[string]struct{}, len(excludeIDs))
+	for _, eid := range excludeIDs {
+		excludeSet[eid] = struct{}{}
+	}
+
+	for _, id := range ids {
+		if _, excluded := excludeSet[id]; excluded {
+			continue
+		}
+		if err := h.Send(ctx, id, data); err != nil && !errors.Is(err, ErrMessageDropped) {
+			h.logger.Warn("broadcastExclude: send failed", "topic", topic, "connID", id, "error", err)
+		}
+	}
+}
+
+// PreparedMessage is a pre-serialized message that avoids repeated json.Marshal
+// when the same payload is broadcast to multiple topics.
+type PreparedMessage struct {
+	data []byte
+}
+
+// NewPreparedMessage marshals v to JSON and wraps it as a PreparedMessage.
+func NewPreparedMessage(v interface{}) (*PreparedMessage, error) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	return &PreparedMessage{data: data}, nil
+}
+
+// NewPreparedMessageFromBytes wraps raw bytes as a PreparedMessage.
+func NewPreparedMessageFromBytes(data []byte) *PreparedMessage {
+	return &PreparedMessage{data: data}
+}
+
+// BroadcastPrepared broadcasts a pre-serialized PreparedMessage to a topic.
+func (h *Hub) BroadcastPrepared(ctx context.Context, topic string, msg *PreparedMessage) {
+	h.Broadcast(ctx, topic, msg.data)
+}
+
+// BroadcastPreparedExclude broadcasts a pre-serialized PreparedMessage to a topic,
+// excluding the specified connection IDs.
+func (h *Hub) BroadcastPreparedExclude(ctx context.Context, topic string, msg *PreparedMessage, excludeIDs ...string) {
+	h.BroadcastExclude(ctx, topic, msg.data, excludeIDs...)
 }
 
 // Subscribe adds a connection to a topic.
@@ -475,4 +540,3 @@ func (h *Hub) flushPending(ctx context.Context, c *Conn) {
 		}
 	}
 }
-

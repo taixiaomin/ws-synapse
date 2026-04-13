@@ -31,6 +31,12 @@ type Server struct {
 	wg      sync.WaitGroup // tracks active read/write pump goroutines
 }
 
+// UpgradeInfo is the return value of the OnUpgrade hook.
+type UpgradeInfo struct {
+	ConnID   string                 // required: connection identifier
+	Metadata map[string]interface{} // optional: auto-injected into Conn.meta via Set()
+}
+
 // ServerOptions holds configuration for a Server.
 type ServerOptions struct {
 	// query param for reconnect token, default "token"
@@ -63,6 +69,11 @@ type ServerOptions struct {
 	// connIDExtractor extracts the connection ID from an HTTP request.
 	connIDExtractor func(r *http.Request) (string, error)
 
+	// onUpgrade is a unified upgrade hook that replaces authenticator + connIDExtractor.
+	// When set, authenticator and connIDExtractor are ignored by HandleHTTP.
+	// Return error to reject the connection (HTTP 401).
+	onUpgrade func(r *http.Request) (*UpgradeInfo, error)
+
 	// max concurrent connections, 0 = unlimited (default 0)
 	maxConnections int64
 
@@ -94,15 +105,15 @@ type ServerOption func(*ServerOptions)
 // defaultServerOptions returns default options for a Server.
 func defaultServerOptions() ServerOptions {
 	return ServerOptions{
-		tokenParam:      "token",
-		sendChannelSize: 256,
-		writeTimeout:    10 * time.Second,
-		pingInterval:    54 * time.Second,
+		tokenParam:         "token",
+		sendChannelSize:    256,
+		writeTimeout:       10 * time.Second,
+		pingInterval:       54 * time.Second,
 		insecureSkipVerify: false,
-		maxMessageSize:  32 * 1024, // 32KB
-		rateLimitBurst:  10,
-		drainTimeout:    5 * time.Second,
-		logger:          defaultLogger(),
+		maxMessageSize:     32 * 1024, // 32KB
+		rateLimitBurst:     10,
+		drainTimeout:       5 * time.Second,
+		logger:             defaultLogger(),
 	}
 }
 
@@ -181,6 +192,14 @@ func WithConnIDExtractor(fn func(r *http.Request) (string, error)) ServerOption 
 	return func(o *ServerOptions) { o.connIDExtractor = fn }
 }
 
+// WithOnUpgrade sets a unified upgrade hook that performs authentication, extracts
+// the connection ID, and optionally provides metadata to inject into the Conn.
+// When set, WithAuthenticator and WithConnIDExtractor are ignored by HandleHTTP.
+// Return a non-nil error to reject the connection (HTTP 401).
+func WithOnUpgrade(fn func(r *http.Request) (*UpgradeInfo, error)) ServerOption {
+	return func(o *ServerOptions) { o.onUpgrade = fn }
+}
+
 // WithMaxConnections sets the maximum number of concurrent WebSocket connections.
 func WithMaxConnections(n int64) ServerOption {
 	return func(o *ServerOptions) { o.maxConnections = n }
@@ -247,4 +266,3 @@ func (jsonTypeParser) ParseType(data []byte) string {
 	}
 	return ""
 }
-
