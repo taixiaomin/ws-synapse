@@ -1,6 +1,6 @@
 module github.com/taixiaomin/ws-synapse
 
-go 1.25.8
+go 1.25.3
 
 require (
 	github.com/coder/websocket v1.8.14
