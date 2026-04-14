@@ -3,6 +3,7 @@ package token
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"sync"
 
@@ -29,12 +30,14 @@ func (m *MemoryTokenProvider) Generate(_ context.Context, connID string) (string
 }
 
 // Validate checks that the provided token matches the stored token for connID.
+// Uses constant-time comparison to prevent timing attacks.
 func (m *MemoryTokenProvider) Validate(_ context.Context, connID, token string) (bool, error) {
 	stored, ok := m.tokens.Load(connID)
 	if !ok {
 		return false, nil
 	}
-	return stored.(string) == token, nil
+	expected := stored.(string)
+	return subtle.ConstantTimeCompare([]byte(expected), []byte(token)) == 1, nil
 }
 
 // Revoke removes the token for the given connID.
@@ -57,4 +60,3 @@ func GenerateRandomToken() string {
 
 // Ensure MemoryTokenProvider implements core.TokenProvider
 var _ core.TokenProvider = (*MemoryTokenProvider)(nil)
-

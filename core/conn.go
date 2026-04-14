@@ -24,6 +24,9 @@ type ConnInfo struct {
 // ErrSendChannelFull is returned when the outbound channel is full.
 var ErrSendChannelFull = errors.New("ws: send channel full")
 
+// ErrConnClosed is returned when attempting to send on a closed connection.
+var ErrConnClosed = errors.New("ws: connection closed")
+
 // MessageEnvelope wraps outbound data with its WebSocket message type.
 type MessageEnvelope struct {
 	Data    []byte
@@ -43,6 +46,8 @@ type Conn struct {
 	mu          sync.Mutex
 	once        sync.Once     // ensures finish() runs only once
 	done        chan struct{} // closed when the connection lifecycle ends
+	drained     chan struct{} // closed when writePump has drained sendCh to PendingStore
+	drainOnce   sync.Once     // ensures drained is closed only once
 	isReconnect bool          // true if connection was established via token reconnect
 	limiter     *rate.Limiter // per-connection inbound rate limiter; nil = unlimited
 
@@ -57,6 +62,7 @@ func NewConn(id, token string, ws *websocket.Conn, chSize int, limiter *rate.Lim
 		ws:      ws,
 		sendCh:  make(chan MessageEnvelope, chSize),
 		done:    make(chan struct{}),
+		drained: make(chan struct{}),
 		limiter: limiter,
 	}
 }
@@ -72,7 +78,7 @@ func (c *Conn) Token() string { return c.token }
 func (c *Conn) IsReconnect() bool { return c.isReconnect }
 
 // Hub returns the Hub that this connection is registered with.
-// Available after the connection is registered (i.e., inside OnConnect and later callbacks).
+// Available inside OnConnect and all subsequent callbacks.
 func (c *Conn) Hub() *Hub { return c.hub }
 
 // RemoteAddr returns the client address, preferring X-Forwarded-For if present.
@@ -140,9 +146,6 @@ func (c *Conn) GetBool(key string) (bool, bool) {
 	return b, ok
 }
 
-// setReconnect sets the reconnect flag (internal use).
-func (c *Conn) setReconnect(reconnect bool) { c.isReconnect = reconnect }
-
 // Send pushes raw text bytes to the outbound queue.
 // The data slice is copied internally to prevent data races.
 // Non-blocking; returns false if the channel is full or the connection has ended.
@@ -177,8 +180,28 @@ func (c *Conn) enqueue(data []byte, msgType websocket.MessageType) bool {
 	}
 }
 
+// enqueueShared pushes a pre-copied envelope without additional copy.
+// Used by Hub.broadcastDirect where the caller has already made one copy
+// that is shared (read-only) across all subscribers.
+func (c *Conn) enqueueShared(env MessageEnvelope) bool {
+	select {
+	case <-c.done:
+		return false
+	default:
+	}
+	select {
+	case c.sendCh <- env:
+		return true
+	case <-c.done:
+		return false
+	default:
+		return false
+	}
+}
+
 // SendJSON marshals v to JSON and pushes it as a text message.
-// Returns ErrSendChannelFull if the outbound channel is full.
+// Returns ErrConnClosed if the connection has ended, or ErrSendChannelFull
+// if the outbound channel is full.
 func (c *Conn) SendJSON(v interface{}) error {
 	data, err := json.Marshal(v)
 	if err != nil {
@@ -187,14 +210,14 @@ func (c *Conn) SendJSON(v interface{}) error {
 	env := MessageEnvelope{Data: data, MsgType: websocket.MessageText}
 	select {
 	case <-c.done:
-		return ErrSendChannelFull
+		return ErrConnClosed
 	default:
 	}
 	select {
 	case c.sendCh <- env:
 		return nil
 	case <-c.done:
-		return ErrSendChannelFull
+		return ErrConnClosed
 	default:
 		return ErrSendChannelFull
 	}
@@ -208,6 +231,18 @@ func (c *Conn) Get(key string) (interface{}, bool) { return c.meta.Load(key) }
 
 // Done returns a channel that is closed when the connection lifecycle ends.
 func (c *Conn) Done() <-chan struct{} { return c.done }
+
+// Drained returns a channel that is closed when the writePump has finished
+// draining sendCh to PendingStore. Used by Hub.register() to synchronize
+// connection replacement with pending message drain.
+func (c *Conn) Drained() <-chan struct{} { return c.drained }
+
+// MarkDrained signals that draining is complete. Safe to call multiple times.
+func (c *Conn) MarkDrained() {
+	c.drainOnce.Do(func() {
+		close(c.drained)
+	})
+}
 
 // WriteEnvelope writes a single message envelope to the underlying WebSocket.
 func (c *Conn) WriteEnvelope(ctx context.Context, env MessageEnvelope, timeout time.Duration) error {
@@ -242,31 +277,4 @@ func (c *Conn) AllowMessage() bool {
 		return true
 	}
 	return c.limiter.Allow()
-}
-
-// Internal access methods for use by other core packages
-
-// writeEnvelope is exported for internal use by server package
-func (c *Conn) writeEnvelope(ctx context.Context, env MessageEnvelope, timeout time.Duration) error {
-	return c.WriteEnvelope(ctx, env, timeout)
-}
-
-// close is exported for internal use
-func (c *Conn) close(reason string) {
-	c.Close(reason)
-}
-
-// closeNow is exported for internal use
-func (c *Conn) closeNow() {
-	c.CloseNow()
-}
-
-// finish is exported for internal use
-func (c *Conn) finish() {
-	c.Finish()
-}
-
-// allowMessage is exported for internal use
-func (c *Conn) allowMessage() bool {
-	return c.AllowMessage()
 }

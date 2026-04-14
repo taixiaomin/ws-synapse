@@ -21,6 +21,7 @@ type Server = core.Server
 type ServerOption = core.ServerOption
 type UpgradeInfo = core.UpgradeInfo
 type PreparedMessage = core.PreparedMessage
+type PendingMessage = core.PendingMessage
 
 // EventHandler Interfaces
 type EventHandler = core.EventHandler
@@ -30,6 +31,8 @@ type Logger = core.Logger
 type MetricsCollector = core.MetricsCollector
 type PendingStore = core.PendingStore
 type TokenProvider = core.TokenProvider
+type ClusterRelay = core.ClusterRelay
+type RelayHandler = core.RelayHandler
 
 // NopLogger Logger Implementations
 type NopLogger = core.NopLogger
@@ -37,11 +40,19 @@ type NopLogger = core.NopLogger
 // MemoryTokenProvider Token Provider
 type MemoryTokenProvider = token.MemoryTokenProvider
 
+// ── Constants ──
+const (
+	MsgTypeText   = core.MsgTypeText
+	MsgTypeBinary = core.MsgTypeBinary
+)
+
 // ── Errors ──
 var (
 	ErrSendChannelFull = core.ErrSendChannelFull
+	ErrConnClosed      = core.ErrConnClosed
 	ErrMaxConnsReached = core.ErrMaxConnsReached
 	ErrMessageDropped  = core.ErrMessageDropped
+	ErrHubShutdown     = core.ErrHubShutdown
 	ErrRateLimited     = core.ErrRateLimited
 )
 
@@ -52,6 +63,7 @@ var (
 	NewServer                   = core.NewServer
 	NewSlogAdapter              = core.NewSlogAdapter
 	NewMemoryTokenProvider      = token.NewMemoryTokenProvider
+	NewRedisTokenProvider       = token.NewRedisTokenProvider
 	NewPreparedMessage          = core.NewPreparedMessage
 	NewPreparedMessageFromBytes = core.NewPreparedMessageFromBytes
 )
@@ -64,6 +76,8 @@ var (
 	WithHubPendingStore  = core.WithHubPendingStore
 	WithHubTopicHandler  = core.WithHubTopicHandler
 	WithHubTokenProvider = core.WithHubTokenProvider
+	WithHubDrainTimeout  = core.WithHubDrainTimeout
+	WithHubClusterRelay  = core.WithHubClusterRelay
 )
 
 // ── Server Options ──
@@ -83,6 +97,7 @@ var (
 	WithRateLimit          = core.WithRateLimit
 	WithTokenProvider      = core.WithTokenProvider
 	WithMessageParser      = core.WithMessageParser
+	WithClusterRelay       = core.WithClusterRelay
 	WithDrainTimeout       = core.WithDrainTimeout
 	WithLogger             = core.WithLogger
 	WithMetrics            = core.WithMetrics

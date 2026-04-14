@@ -25,6 +25,7 @@ func NewServer(handler EventHandler, opts ...ServerOption) *Server {
 		WithHubLogger(o.logger),
 		WithHubMaxConns(o.maxConnections),
 		WithHubMetrics(m),
+		WithHubDrainTimeout(o.drainTimeout),
 	}
 	if o.pendingStore != nil {
 		hubOpts = append(hubOpts, WithHubPendingStore(o.pendingStore))
@@ -37,7 +38,18 @@ func NewServer(handler EventHandler, opts ...ServerOption) *Server {
 		hubOpts = append(hubOpts, WithHubTopicHandler(th))
 	}
 
+	if o.clusterRelay != nil {
+		hubOpts = append(hubOpts, WithHubClusterRelay(o.clusterRelay))
+	}
+
 	hub := NewHub(hubOpts...)
+
+	// Start the cluster relay after Hub creation so relay can call back into Hub.
+	if o.clusterRelay != nil {
+		if err := o.clusterRelay.Start(hub); err != nil {
+			o.logger.Error("cluster relay start failed", "error", err)
+		}
+	}
 
 	// Resolve message parser.
 	parser := o.messageParser
@@ -61,7 +73,16 @@ func (s *Server) Hub() *Hub { return s.hub }
 // finish draining. The context controls the maximum time to wait.
 // An optional finalMessage is broadcast to all connections before closing.
 func (s *Server) Shutdown(ctx context.Context, finalMessage ...[]byte) {
-	s.hub.Shutdown(finalMessage...)
+	// Snapshot all conns BEFORE Hub.Shutdown clears the map,
+	// so the timeout branch can force-close them if needed.
+	var allConns []*Conn
+	s.hub.conns.Range(func(_, value interface{}) bool {
+		allConns = append(allConns, value.(*Conn))
+		return true
+	})
+
+	s.hub.Shutdown(ctx, finalMessage...)
+
 	done := make(chan struct{})
 	go func() {
 		s.wg.Wait()
@@ -70,6 +91,10 @@ func (s *Server) Shutdown(ctx context.Context, finalMessage ...[]byte) {
 	select {
 	case <-done:
 	case <-ctx.Done():
+		// Timeout: force-close all connections to unblock stuck readPump goroutines.
+		for _, c := range allConns {
+			c.CloseNow()
+		}
 	}
 }
 
@@ -175,7 +200,10 @@ func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, connID string, 
 	wsConn.SetReadLimit(s.opts.maxMessageSize)
 
 	// ── 4. Token handling
-	ctx := r.Context()
+	// Use the HTTP request context only for short-lived pre-upgrade operations
+	// (token validation, generation). The pump goroutines get an independent
+	// context so they are not cancelled when the HTTP handler returns.
+	httpCtx := r.Context()
 
 	// Resolve token: explicit UpgradeOption > query string fallback.
 	tok := ""
@@ -188,14 +216,20 @@ func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, connID string, 
 	isReconnect := false
 	if s.opts.tokenProvider != nil {
 		if tok != "" {
-			valid, vErr := s.opts.tokenProvider.Validate(ctx, connID, tok)
+			valid, vErr := s.opts.tokenProvider.Validate(httpCtx, connID, tok)
 			if vErr != nil || !valid {
 				_ = wsConn.Close(websocket.StatusPolicyViolation, "invalid reconnect token")
 				return
 			}
 			isReconnect = true
+			// Rotate token: old token is now invalid, generate a new one.
+			tok, err = s.opts.tokenProvider.Generate(httpCtx, connID)
+			if err != nil {
+				_ = wsConn.Close(websocket.StatusInternalError, "token rotation failed")
+				return
+			}
 		} else {
-			tok, err = s.opts.tokenProvider.Generate(ctx, connID)
+			tok, err = s.opts.tokenProvider.Generate(httpCtx, connID)
 			if err != nil {
 				_ = wsConn.Close(websocket.StatusInternalError, "token generation failed")
 				return
@@ -209,7 +243,7 @@ func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, connID string, 
 		limiter = rate.NewLimiter(rate.Limit(s.opts.rateLimitPerSec), s.opts.rateLimitBurst)
 	}
 	conn := NewConn(connID, tok, wsConn, s.opts.sendChannelSize, limiter)
-	conn.setReconnect(isReconnect)
+	conn.isReconnect = isReconnect
 
 	// Snapshot HTTP request info so OnConnect can access query params, headers, etc.
 	conn.info = &ConnInfo{
@@ -225,14 +259,19 @@ func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, connID string, 
 		}
 	}
 
-	// ── 6. Fire OnConnect BEFORE registering in Hub
-	if err := s.onConnect(ctx, conn); err != nil {
+	// ── 6. Inject Hub reference BEFORE OnConnect so conn.Hub() is usable.
+	conn.hub = s.hub
+
+	// ── 7. Fire OnConnect (conn.Hub() is now available)
+	if err := s.onConnect(httpCtx, conn); err != nil {
+		conn.hub = nil
 		_ = wsConn.Close(websocket.StatusPolicyViolation, err.Error())
 		return
 	}
 
-	// ── 7. Register in Hub (replaces old conn, flushes pending)
-	if err := s.hub.register(ctx, conn); err != nil {
+	// ── 8. Register in Hub (replaces old conn, flushes pending)
+	if err := s.hub.register(httpCtx, conn); err != nil {
+		conn.hub = nil
 		_ = wsConn.Close(websocket.StatusTryAgainLater, err.Error())
 		return
 	}
@@ -241,16 +280,21 @@ func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, connID string, 
 		s.metrics.IncReconnects()
 	}
 
-	// ── 8. Start pumps
+	// ── 9. Start pumps with an independent context (not tied to HTTP request).
+	// This prevents framework-specific request context cancellation from killing
+	// long-lived WebSocket connections. The context is cancelled when readPump exits.
+	connCtx, connCancel := context.WithCancel(context.Background())
 	s.wg.Add(2)
-	go s.writePump(ctx, conn)
-	s.readPump(ctx, conn) // blocks
+	go s.writePump(connCtx, conn)
+	s.readPump(connCtx, connCancel, conn) // blocks
 }
 
 // readPump reads messages from the WebSocket and dispatches to EventHandler.
-func (s *Server) readPump(ctx context.Context, c *Conn) {
+// connCancel is called when readPump exits to signal writePump to stop.
+func (s *Server) readPump(ctx context.Context, connCancel context.CancelFunc, c *Conn) {
 	defer func() {
 		defer s.wg.Done()
+		defer connCancel()
 
 		if r := recover(); r != nil {
 			s.opts.logger.Error("panic in readPump", "connID", c.ID(), "panic", r)
@@ -260,7 +304,12 @@ func (s *Server) readPump(ctx context.Context, c *Conn) {
 		removed := s.hub.unregister(c)
 		c.Finish()
 		c.CloseNow()
-		s.onDisconnect(ctx, c)
+
+		// Use a fresh context for disconnect cleanup because the original HTTP
+		// request context may already be cancelled at this point.
+		disconnectCtx, disconnectCancel := context.WithTimeout(context.Background(), s.opts.drainTimeout)
+		s.onDisconnect(disconnectCtx, c)
+		disconnectCancel()
 
 		if removed && s.opts.tokenProvider != nil {
 			_ = s.opts.tokenProvider.Revoke(context.Background(), c.ID())
@@ -313,13 +362,13 @@ func (s *Server) writePump(ctx context.Context, c *Conn) {
 	for {
 		select {
 		case data := <-c.sendCh:
-			if err := c.writeEnvelope(ctx, data, s.opts.writeTimeout); err != nil {
+			if err := c.WriteEnvelope(ctx, data, s.opts.writeTimeout); err != nil {
 				return
 			}
 			s.metrics.IncMessagesOut()
 			// Batch flush: write any messages already queued in the buffer.
 			for n := len(c.sendCh); n > 0; n-- {
-				if err := c.writeEnvelope(ctx, <-c.sendCh, s.opts.writeTimeout); err != nil {
+				if err := c.WriteEnvelope(ctx, <-c.sendCh, s.opts.writeTimeout); err != nil {
 					return
 				}
 				s.metrics.IncMessagesOut()
@@ -343,7 +392,10 @@ func (s *Server) writePump(ctx context.Context, c *Conn) {
 }
 
 // drainToPending saves remaining messages in sendCh to the pending store.
+// Signals c.MarkDrained() when done so Hub.register() can synchronize.
 func (s *Server) drainToPending(c *Conn) {
+	defer c.MarkDrained()
+
 	if s.hub.pendingStore == nil {
 		return
 	}
@@ -352,7 +404,8 @@ func (s *Server) drainToPending(c *Conn) {
 	for {
 		select {
 		case env := <-c.sendCh:
-			if err := s.hub.pendingStore.Push(drainCtx, c.ID(), env.Data); err != nil {
+			pm := PendingMessage{Data: env.Data, MsgType: envelopeToMsgType(env)}
+			if err := s.hub.pendingStore.PushEnvelope(drainCtx, c.ID(), pm); err != nil {
 				s.hub.logger.Error("drainToPending: push failed", "connID", c.ID(), "error", err)
 				return
 			}
@@ -362,6 +415,14 @@ func (s *Server) drainToPending(c *Conn) {
 			return
 		}
 	}
+}
+
+// envelopeToMsgType converts a websocket.MessageType to the PendingMessage MsgType constant.
+func envelopeToMsgType(env MessageEnvelope) int {
+	if env.MsgType == websocket.MessageBinary {
+		return MsgTypeBinary
+	}
+	return MsgTypeText
 }
 
 // ── Panic-safe event handler wrappers ──────────────────────────────────────
@@ -382,6 +443,7 @@ func (s *Server) onMessage(ctx context.Context, c *Conn, msg *Message) (err erro
 		if r := recover(); r != nil {
 			err = fmt.Errorf("OnMessage panic: %v", r)
 			s.opts.logger.Error("panic in OnMessage", "connID", c.ID(), "panic", r)
+			s.metrics.IncErrors()
 		}
 	}()
 	return s.handler.OnMessage(ctx, c, msg)

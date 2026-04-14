@@ -17,7 +17,7 @@ func jsonError(w http.ResponseWriter, msg string, code int) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(code)
 	b, _ := json.Marshal(msg)
-	_, _ = fmt.Fprintf(w, `{"error":%q}`, b)
+	_, _ = fmt.Fprintf(w, `{"error":%s}`, b)
 }
 
 // Server is the WebSocket entry point. It upgrades HTTP connections,
@@ -88,6 +88,9 @@ type ServerOptions struct {
 
 	// messageParser extracts the "type" from inbound messages.
 	messageParser MessageParser
+
+	// cluster relay for multi-node message routing; nil = single-node mode
+	clusterRelay ClusterRelay
 
 	// drain timeout for pending messages on disconnect (default 5s)
 	drainTimeout time.Duration
@@ -221,6 +224,11 @@ func WithTokenProvider(tp TokenProvider) ServerOption {
 // WithMessageParser sets a custom MessageParser for extracting message types from inbound data.
 func WithMessageParser(p MessageParser) ServerOption {
 	return func(o *ServerOptions) { o.messageParser = p }
+}
+
+// WithClusterRelay enables distributed mode with cross-node message routing.
+func WithClusterRelay(r ClusterRelay) ServerOption {
+	return func(o *ServerOptions) { o.clusterRelay = r }
 }
 
 // WithDrainTimeout sets the maximum time to drain pending messages on disconnect (default 5s).
