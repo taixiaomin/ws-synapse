@@ -17,6 +17,10 @@ type slogAdapter struct {
 	logger *slog.Logger
 }
 
+func (s *slogAdapter) Debug(msg string, keysAndValues ...any) {
+	s.logger.Debug(msg, keysAndValues...)
+}
+
 func (s *slogAdapter) Info(msg string, keysAndValues ...any) {
 	s.logger.Info(msg, keysAndValues...)
 }
@@ -43,7 +47,7 @@ func NewSlogAdapter(l *slog.Logger) Logger {
 // NopLogger is a Logger that discards all output. Useful for tests.
 type NopLogger struct{}
 
-func (NopLogger) Info(string, ...any) {}
-func (NopLogger) Warn(string, ...any) {}
+func (NopLogger) Debug(string, ...any) {}
+func (NopLogger) Info(string, ...any)  {}
+func (NopLogger) Warn(string, ...any)  {}
 func (NopLogger) Error(string, ...any) {}
-

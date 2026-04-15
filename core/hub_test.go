@@ -453,6 +453,80 @@ func TestHub_LocalBroadcast(t *testing.T) {
 	}
 }
 
+func TestHub_Send_OverflowToPending(t *testing.T) {
+	ps := newMemPendingStore()
+	h := NewHub(WithHubPendingStore(ps))
+	// Create a connection with sendCh size=1 to easily trigger overflow.
+	c := &Conn{
+		id:      "u1",
+		sendCh:  make(chan MessageEnvelope, 1),
+		done:    make(chan struct{}),
+		drained: make(chan struct{}),
+	}
+	c.hub = h
+	_ = h.register(context.Background(), c)
+
+	ctx := context.Background()
+
+	// First send — goes into sendCh (capacity 1).
+	if err := h.Send(ctx, "u1", []byte("msg1")); err != nil {
+		t.Fatalf("first send: %v", err)
+	}
+	// Second send — sendCh full, should overflow to PendingStore.
+	if err := h.Send(ctx, "u1", []byte("msg2")); err != nil {
+		t.Fatalf("second send (overflow): %v", err)
+	}
+	// Third send — also overflow.
+	if err := h.Send(ctx, "u1", []byte("msg3")); err != nil {
+		t.Fatalf("third send (overflow): %v", err)
+	}
+
+	// Verify: 1 message in sendCh, 2 in PendingStore.
+	if len(c.sendCh) != 1 {
+		t.Fatalf("expected 1 in sendCh, got %d", len(c.sendCh))
+	}
+	if ps.count("u1") != 2 {
+		t.Fatalf("expected 2 in pending store, got %d", ps.count("u1"))
+	}
+
+	// Verify overflow flag is set.
+	if !c.HasOverflow() {
+		t.Fatal("expected overflow flag to be set")
+	}
+}
+
+func TestHub_Broadcast_OverflowToPending(t *testing.T) {
+	ps := newMemPendingStore()
+	h := NewHub(WithHubPendingStore(ps))
+	// sendCh size=1.
+	c := &Conn{
+		id:      "u1",
+		sendCh:  make(chan MessageEnvelope, 1),
+		done:    make(chan struct{}),
+		drained: make(chan struct{}),
+	}
+	c.hub = h
+	_ = h.register(context.Background(), c)
+	h.Subscribe(context.Background(), "u1", "room")
+
+	ctx := context.Background()
+
+	// First broadcast fills sendCh.
+	h.Broadcast(ctx, "room", []byte("b1"))
+	// Second broadcast — sendCh full, should overflow.
+	h.Broadcast(ctx, "room", []byte("b2"))
+
+	if len(c.sendCh) != 1 {
+		t.Fatalf("expected 1 in sendCh, got %d", len(c.sendCh))
+	}
+	if ps.count("u1") != 1 {
+		t.Fatalf("expected 1 in pending store, got %d", ps.count("u1"))
+	}
+	if !c.HasOverflow() {
+		t.Fatal("expected overflow flag to be set")
+	}
+}
+
 func TestHub_MaxConns(t *testing.T) {
 	h := NewHub(WithHubMaxConns(1))
 	c1 := testConn("u1")

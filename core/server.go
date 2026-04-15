@@ -222,7 +222,9 @@ func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, connID string, 
 				return
 			}
 			isReconnect = true
-			// Rotate token: old token is now invalid, generate a new one.
+			// Explicitly revoke old token before generating a new one, so custom
+			// TokenProvider implementations that don't overwrite on Generate are safe.
+			_ = s.opts.tokenProvider.Revoke(httpCtx, connID)
 			tok, err = s.opts.tokenProvider.Generate(httpCtx, connID)
 			if err != nil {
 				_ = wsConn.Close(websocket.StatusInternalError, "token rotation failed")
@@ -265,6 +267,10 @@ func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, connID string, 
 	// ── 7. Fire OnConnect (conn.Hub() is now available)
 	if err := s.onConnect(httpCtx, conn); err != nil {
 		conn.hub = nil
+		// Revoke the token we just generated so it cannot be reused.
+		if s.opts.tokenProvider != nil && tok != "" {
+			_ = s.opts.tokenProvider.Revoke(httpCtx, connID)
+		}
 		_ = wsConn.Close(websocket.StatusPolicyViolation, err.Error())
 		return
 	}
@@ -272,6 +278,9 @@ func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, connID string, 
 	// ── 8. Register in Hub (replaces old conn, flushes pending)
 	if err := s.hub.register(httpCtx, conn); err != nil {
 		conn.hub = nil
+		if s.opts.tokenProvider != nil && tok != "" {
+			_ = s.opts.tokenProvider.Revoke(httpCtx, connID)
+		}
 		_ = wsConn.Close(websocket.StatusTryAgainLater, err.Error())
 		return
 	}
@@ -293,9 +302,6 @@ func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, connID string, 
 // connCancel is called when readPump exits to signal writePump to stop.
 func (s *Server) readPump(ctx context.Context, connCancel context.CancelFunc, c *Conn) {
 	defer func() {
-		defer s.wg.Done()
-		defer connCancel()
-
 		if r := recover(); r != nil {
 			s.opts.logger.Error("panic in readPump", "connID", c.ID(), "panic", r)
 			s.metrics.IncErrors()
@@ -314,6 +320,11 @@ func (s *Server) readPump(ctx context.Context, connCancel context.CancelFunc, c 
 		if removed && s.opts.tokenProvider != nil {
 			_ = s.opts.tokenProvider.Revoke(context.Background(), c.ID())
 		}
+
+		// Cancel the connection context to signal writePump to stop,
+		// then mark this goroutine as done.
+		connCancel()
+		s.wg.Done()
 	}()
 
 	for {
@@ -349,14 +360,21 @@ func (s *Server) readPump(ctx context.Context, connCancel context.CancelFunc, c 
 func (s *Server) writePump(ctx context.Context, c *Conn) {
 	ticker := time.NewTicker(s.opts.pingInterval)
 	defer func() {
-		defer s.wg.Done()
-
 		if r := recover(); r != nil {
 			s.opts.logger.Error("panic in writePump", "connID", c.ID(), "panic", r)
 			s.metrics.IncErrors()
 		}
 		ticker.Stop()
 		s.drainToPending(c)
+
+		// Force-close the underlying WebSocket so that readPump's blocking
+		// c.ws.Read() returns immediately with an error. Without this,
+		// a dead connection (detected by ping failure or write error) would
+		// linger in the Hub until TCP keepalive times out (often 2+ hours),
+		// preventing unregister, onDisconnect, and token revocation.
+		c.CloseNow()
+
+		s.wg.Done()
 	}()
 
 	for {
@@ -372,6 +390,11 @@ func (s *Server) writePump(ctx context.Context, c *Conn) {
 					return
 				}
 				s.metrics.IncMessagesOut()
+			}
+
+			// After draining sendCh, check for overflow messages in PendingStore.
+			if c.HasOverflow() {
+				s.drainOverflow(ctx, c)
 			}
 
 		case <-ticker.C:
@@ -415,6 +438,43 @@ func (s *Server) drainToPending(c *Conn) {
 			return
 		}
 	}
+}
+
+// drainOverflow pulls overflow messages from PendingStore and writes them to the WebSocket.
+// Called by writePump after sendCh is drained when the overflow flag is set.
+func (s *Server) drainOverflow(ctx context.Context, c *Conn) {
+	if s.hub.pendingStore == nil {
+		c.clearOverflow()
+		return
+	}
+	msgs, err := s.hub.pendingStore.PopAll(ctx, c.ID())
+	if err != nil {
+		s.hub.logger.Warn("drainOverflow: PopAll failed", "connID", c.ID(), "error", err)
+		return // Don't clear overflow — retry on next sendCh drain.
+	}
+	if len(msgs) == 0 {
+		c.clearOverflow()
+		return
+	}
+	for i, m := range msgs {
+		msgType := websocket.MessageText
+		if m.MsgType == MsgTypeBinary {
+			msgType = websocket.MessageBinary
+		}
+		env := MessageEnvelope{Data: m.Data, MsgType: msgType}
+		if err := c.WriteEnvelope(ctx, env, s.opts.writeTimeout); err != nil {
+			// Write failed — re-push remaining messages back to PendingStore.
+			for _, remaining := range msgs[i:] {
+				if pushErr := s.hub.pendingStore.PushEnvelope(ctx, c.ID(), remaining); pushErr != nil {
+					s.hub.logger.Error("drainOverflow: re-push failed", "connID", c.ID(), "error", pushErr)
+					return
+				}
+			}
+			return
+		}
+		s.metrics.IncMessagesOut()
+	}
+	c.clearOverflow()
 }
 
 // envelopeToMsgType converts a websocket.MessageType to the PendingMessage MsgType constant.

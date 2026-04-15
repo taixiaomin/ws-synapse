@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -51,9 +52,19 @@ type Conn struct {
 	isReconnect bool          // true if connection was established via token reconnect
 	limiter     *rate.Limiter // per-connection inbound rate limiter; nil = unlimited
 
-	hub  *Hub      // back-reference injected by Hub.register()
-	info *ConnInfo // HTTP handshake snapshot; nil if not set
+	overflow atomic.Bool // true when PendingStore has overflow messages to drain
+	hub      *Hub        // back-reference injected by Hub.register()
+	info     *ConnInfo   // HTTP handshake snapshot; nil if not set
 }
+
+// markOverflow signals that overflow messages have been pushed to PendingStore.
+func (c *Conn) markOverflow() { c.overflow.Store(true) }
+
+// HasOverflow reports whether there are overflow messages in PendingStore.
+func (c *Conn) HasOverflow() bool { return c.overflow.Load() }
+
+// clearOverflow resets the overflow flag after all overflow messages are drained.
+func (c *Conn) clearOverflow() { c.overflow.Store(false) }
 
 func NewConn(id, token string, ws *websocket.Conn, chSize int, limiter *rate.Limiter) *Conn {
 	return &Conn{

@@ -83,7 +83,7 @@ var (
 // ── Server Options ──
 var (
 	WithTokenParam         = core.WithTokenParam
-	WithSendChSize         = core.WithSendChSize
+	WithSendChannelSize    = core.WithSendChannelSize
 	WithWriteTimeout       = core.WithWriteTimeout
 	WithPingInterval       = core.WithPingInterval
 	WithPendingStore       = core.WithPendingStore

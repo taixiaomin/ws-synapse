@@ -164,7 +164,9 @@ func (r *RedisClusterRelay) OnUnsubscribe(ctx context.Context, _, topic string, 
 	r.topicMu.Lock()
 	if val, ok := r.localTopics.Load(topic); ok {
 		cnt := val.(*int64)
-		*cnt--
+		if *cnt > 0 {
+			*cnt--
+		}
 	}
 	r.topicMu.Unlock()
 	return nil
@@ -187,7 +189,7 @@ func (r *RedisClusterRelay) PublishSend(ctx context.Context, connID string, data
 	}
 
 	// 3. Check target node alive.
-	alive, err := r.client.Exists(ctx, r.nodeAliveKey2(targetNode)).Result()
+	alive, err := r.client.Exists(ctx, r.nodeAliveKeyFor(targetNode)).Result()
 	if err != nil || alive == 0 {
 		// Target node dead — clean up stale registry and buffer.
 		_ = r.client.Del(ctx, r.connKey(connID)).Err()
@@ -232,6 +234,17 @@ func (r *RedisClusterRelay) PublishBroadcast(ctx context.Context, topic string, 
 		if nid == r.nodeID {
 			continue // Already handled locally by Hub.
 		}
+
+		// Check if target node is alive before writing to its stream.
+		// If dead, remove it from the topic set to prevent future wasted writes.
+		alive, aliveErr := r.client.Exists(ctx, r.nodeAliveKeyFor(nid)).Result()
+		if aliveErr != nil || alive == 0 {
+			r.logger.Warn("broadcast: removing dead node from topic set",
+				"deadNode", nid, "topic", topic)
+			_ = r.client.SRem(ctx, r.topicKey(topic), nid).Err()
+			continue
+		}
+
 		envelope := map[string]interface{}{
 			"action":     "broadcast",
 			"topic":      topic,
@@ -265,14 +278,17 @@ func (r *RedisClusterRelay) heartbeatLoop() {
 		case <-ticker.C:
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 
-			// Refresh node alive.
-			_ = r.client.Expire(ctx, r.nodeAliveKey(), r.nodeTTL).Err()
+			// Refresh node alive — use Set (not Expire) to recreate the key
+			// if it was deleted by another node that mistakenly thought we were dead.
+			_ = r.client.Set(ctx, r.nodeAliveKey(), "1", r.nodeTTL).Err()
 
-			// Refresh connection TTLs in a pipeline.
+			// Refresh connection registrations in a pipeline — use Set (not Expire)
+			// to recreate keys that may have been cleaned up by other nodes during
+			// a transient Redis outage longer than connTTL.
 			pipe := r.client.Pipeline()
 			r.localConns.Range(func(key, _ any) bool {
 				connID := key.(string)
-				pipe.Expire(ctx, r.connKey(connID), r.connTTL)
+				pipe.Set(ctx, r.connKey(connID), r.nodeID, r.connTTL)
 				return true
 			})
 			_, _ = pipe.Exec(ctx)
@@ -381,14 +397,15 @@ func (r *RedisClusterRelay) fallbackToPending(ctx context.Context, connID string
 	if r.pendingStore != nil {
 		return r.pendingStore.Push(ctx, connID, data)
 	}
-	return nil
+	r.logger.Warn("relay: message dropped (no pending store)", "connID", connID)
+	return core.ErrMessageDropped
 }
 
 func (r *RedisClusterRelay) nodeAliveKey() string {
 	return r.keyPrefix + "node:alive:" + r.nodeID
 }
 
-func (r *RedisClusterRelay) nodeAliveKey2(nodeID string) string {
+func (r *RedisClusterRelay) nodeAliveKeyFor(nodeID string) string {
 	return r.keyPrefix + "node:alive:" + nodeID
 }
 
@@ -411,6 +428,7 @@ func isGroupExistsErr(err error) bool {
 // nopLogger is a no-op logger used when none is configured.
 type nopLogger struct{}
 
+func (nopLogger) Debug(string, ...any) {}
 func (nopLogger) Info(string, ...any)  {}
 func (nopLogger) Warn(string, ...any)  {}
 func (nopLogger) Error(string, ...any) {}

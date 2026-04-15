@@ -53,7 +53,8 @@ func generateRandomToken() string {
 	return hex.EncodeToString(b)
 }
 
-// GenerateRandomToken is exported for internal use
+// GenerateRandomToken produces a cryptographically random 32-character hex token.
+// It can be used by custom TokenProvider implementations that need secure random tokens.
 func GenerateRandomToken() string {
 	return generateRandomToken()
 }

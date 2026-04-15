@@ -123,6 +123,11 @@ func (h *Hub) register(ctx context.Context, c *Conn) error {
 		h.connCount.Add(-1)
 		h.metrics.DecConnections()
 
+		// Clean up old connection's topic subscriptions so they don't leak.
+		// The old readPump's unregister will return false (CompareAndDelete fails)
+		// and skip unsubscribeAll, so we must do it here.
+		h.unsubscribeAll(c.id)
+
 		// Wait for the old connection's writePump to drain remaining messages
 		// to PendingStore before we PopAll for the new connection.
 		select {
@@ -182,8 +187,11 @@ func (h *Hub) Send(ctx context.Context, connID string, data []byte) error {
 		if c.Send(data) {
 			return nil
 		}
-		// Connection is online but channel is full — do NOT push to PendingStore
-		// because those messages would be orphaned until the next reconnect.
+		// sendCh full — overflow to PendingStore so writePump can drain later.
+		if h.pendingStore != nil {
+			c.markOverflow()
+			return h.pendingStore.PushEnvelope(ctx, connID, PendingMessage{Data: data, MsgType: MsgTypeText})
+		}
 		h.logger.Warn("send channel full", "connID", connID)
 		h.metrics.IncDrops()
 		return ErrSendChannelFull
@@ -218,6 +226,10 @@ func (h *Hub) SendBinary(ctx context.Context, connID string, data []byte) error 
 		c := val.(*Conn)
 		if c.SendBinary(data) {
 			return nil
+		}
+		if h.pendingStore != nil {
+			c.markOverflow()
+			return h.pendingStore.PushEnvelope(ctx, connID, PendingMessage{Data: data, MsgType: MsgTypeBinary})
 		}
 		h.logger.Warn("sendBinary channel full", "connID", connID)
 		h.metrics.IncDrops()
@@ -301,14 +313,27 @@ func (h *Hub) broadcastDirect(ctx context.Context, topic string, data []byte, ex
 			if c.enqueueShared(env) {
 				continue
 			}
-			// Online but channel full.
+			// Online but channel full — overflow to PendingStore.
+			if h.pendingStore != nil {
+				c.markOverflow()
+				pendingCp := make([]byte, len(data))
+				copy(pendingCp, data)
+				pm := PendingMessage{Data: pendingCp, MsgType: MsgTypeText}
+				if err := h.pendingStore.PushEnvelope(ctx, id, pm); err != nil {
+					h.logger.Warn("broadcast: overflow push failed", "topic", topic, "connID", id, "error", err)
+					h.metrics.IncDrops()
+				}
+				continue
+			}
 			h.logger.Warn("broadcast: channel full", "topic", topic, "connID", id)
 			h.metrics.IncDrops()
 			continue
 		}
 		// Offline — fall back to PendingStore (needs its own copy since env.Data is shared).
 		if h.pendingStore != nil {
-			pm := PendingMessage{Data: data, MsgType: MsgTypeText}
+			pendingCp := make([]byte, len(data))
+			copy(pendingCp, data)
+			pm := PendingMessage{Data: pendingCp, MsgType: MsgTypeText}
 			if err := h.pendingStore.PushEnvelope(ctx, id, pm); err != nil {
 				h.logger.Warn("broadcast: pending push failed", "topic", topic, "connID", id, "error", err)
 				h.metrics.IncDrops()
@@ -351,9 +376,16 @@ func (h *Hub) BroadcastPreparedExclude(ctx context.Context, topic string, msg *P
 }
 
 // Subscribe adds a connection to a topic.
+// Returns false only if the Hub has been shut down.
+// Subscriptions created during OnConnect (before register) are safe because
+// unregister always calls unsubscribeAll to clean up.
 // If the Hub has a TopicEventHandler, OnSubscribe is called after the
 // subscription is recorded.
-func (h *Hub) Subscribe(ctx context.Context, connID, topic string) {
+func (h *Hub) Subscribe(ctx context.Context, connID, topic string) bool {
+	if h.closed.Load() {
+		return false
+	}
+
 	h.mu.Lock()
 
 	subs := h.topics[topic]
@@ -380,6 +412,7 @@ func (h *Hub) Subscribe(ctx context.Context, connID, topic string) {
 			h.logger.Warn("relay: subscribe failed", "connID", connID, "topic", topic, "error", err)
 		}
 	}
+	return true
 }
 
 // Unsubscribe removes a connection from a topic.
@@ -495,12 +528,14 @@ func (h *Hub) CloseTopic(ctx context.Context, topic string, data []byte) {
 		}
 	}
 
-	for _, id := range ids {
+	for i, id := range ids {
 		if h.topicHandler != nil {
 			h.topicHandler.OnUnsubscribe(ctx, id, topic)
 		}
 		if h.relay != nil {
-			if err := h.relay.OnUnsubscribe(ctx, id, topic, true); err != nil {
+			// Only the first call needs lastOnNode=true to remove the node from
+			// the topic set; subsequent calls pass false to avoid redundant SRem.
+			if err := h.relay.OnUnsubscribe(ctx, id, topic, i == 0); err != nil {
 				h.logger.Warn("closeTopic: relay unsubscribe failed", "topic", topic, "connID", id, "error", err)
 			}
 		}
@@ -511,6 +546,7 @@ func (h *Hub) CloseTopic(ctx context.Context, topic string, data []byte) {
 // Only unsubscribes if the connection was actually found and removed,
 // preventing a race where a new connection with the same ID could have
 // its subscriptions incorrectly cleared.
+// Also revokes the reconnect token if a TokenProvider is configured.
 func (h *Hub) CloseConn(connID, reason string) {
 	if val, loaded := h.conns.LoadAndDelete(connID); loaded {
 		c := val.(*Conn)
@@ -519,6 +555,16 @@ func (h *Hub) CloseConn(connID, reason string) {
 		h.connCount.Add(-1)
 		h.metrics.DecConnections()
 		h.unsubscribeAll(connID)
+		if h.relay != nil {
+			if err := h.relay.OnUnregister(context.Background(), connID); err != nil {
+				h.logger.Warn("closeConn: relay unregister failed", "connID", connID, "error", err)
+			}
+		}
+		if h.tokenProvider != nil {
+			if err := h.tokenProvider.Revoke(context.Background(), connID); err != nil {
+				h.logger.Warn("closeConn: token revoke failed", "connID", connID, "error", err)
+			}
+		}
 	}
 }
 
@@ -653,6 +699,11 @@ func (h *Hub) LocalSend(ctx context.Context, connID string, data []byte) error {
 		c := val.(*Conn)
 		if c.Send(data) {
 			return nil
+		}
+		// sendCh full — overflow to PendingStore.
+		if h.pendingStore != nil {
+			c.markOverflow()
+			return h.pendingStore.Push(ctx, connID, data)
 		}
 		h.metrics.IncDrops()
 		return ErrSendChannelFull

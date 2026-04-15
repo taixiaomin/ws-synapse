@@ -25,7 +25,7 @@ func jsonError(w http.ResponseWriter, msg string, code int) {
 type Server struct {
 	hub     *Hub
 	handler EventHandler
-	opts    ServerOptions
+	opts    serverOptions
 	metrics MetricsCollector
 	parser  MessageParser
 	wg      sync.WaitGroup // tracks active read/write pump goroutines
@@ -37,8 +37,8 @@ type UpgradeInfo struct {
 	Metadata map[string]interface{} // optional: auto-injected into Conn.meta via Set()
 }
 
-// ServerOptions holds configuration for a Server.
-type ServerOptions struct {
+// serverOptions holds configuration for a Server.
+type serverOptions struct {
 	// query param for reconnect token, default "token"
 	tokenParam string
 
@@ -103,11 +103,11 @@ type ServerOptions struct {
 }
 
 // ServerOption configures the Server.
-type ServerOption func(*ServerOptions)
+type ServerOption func(*serverOptions)
 
 // defaultServerOptions returns default options for a Server.
-func defaultServerOptions() ServerOptions {
-	return ServerOptions{
+func defaultServerOptions() serverOptions {
+	return serverOptions{
 		tokenParam:         "token",
 		sendChannelSize:    256,
 		writeTimeout:       10 * time.Second,
@@ -121,7 +121,7 @@ func defaultServerOptions() ServerOptions {
 }
 
 // validate clamps or fixes invalid option values to prevent panics at runtime.
-func (o *ServerOptions) validate() {
+func (o *serverOptions) validate() {
 	if o.sendChannelSize < 1 {
 		o.sendChannelSize = 1
 	}
@@ -147,52 +147,55 @@ func (o *ServerOptions) validate() {
 
 // WithTokenParam sets the query parameter name for reconnect token (default "token").
 func WithTokenParam(param string) ServerOption {
-	return func(o *ServerOptions) { o.tokenParam = param }
+	return func(o *serverOptions) { o.tokenParam = param }
 }
 
-// WithSendChSize sets the outbound message channel buffer size (default 256).
-func WithSendChSize(size int) ServerOption {
-	return func(o *ServerOptions) { o.sendChannelSize = size }
+// WithSendChannelSize sets the outbound message channel buffer size (default 256).
+func WithSendChannelSize(size int) ServerOption {
+	return func(o *serverOptions) { o.sendChannelSize = size }
 }
+
+// WithSendChSize is an alias for WithSendChannelSize (deprecated, use WithSendChannelSize).
+var WithSendChSize = WithSendChannelSize
 
 // WithWriteTimeout sets the per-write timeout (default 10s).
 func WithWriteTimeout(d time.Duration) ServerOption {
-	return func(o *ServerOptions) { o.writeTimeout = d }
+	return func(o *serverOptions) { o.writeTimeout = d }
 }
 
 // WithPingInterval sets the heartbeat ping interval (default 54s).
 func WithPingInterval(d time.Duration) ServerOption {
-	return func(o *ServerOptions) { o.pingInterval = d }
+	return func(o *serverOptions) { o.pingInterval = d }
 }
 
 // WithPendingStore enables offline message buffering with the given store.
 func WithPendingStore(store PendingStore) ServerOption {
-	return func(o *ServerOptions) { o.pendingStore = store }
+	return func(o *serverOptions) { o.pendingStore = store }
 }
 
 // WithInsecureSkipVerify controls WebSocket origin checking (default false).
 func WithInsecureSkipVerify(skip bool) ServerOption {
-	return func(o *ServerOptions) { o.insecureSkipVerify = skip }
+	return func(o *serverOptions) { o.insecureSkipVerify = skip }
 }
 
 // WithAllowedOrigins sets the allowed origin patterns for WebSocket connections.
 func WithAllowedOrigins(origins ...string) ServerOption {
-	return func(o *ServerOptions) { o.allowedOrigins = origins }
+	return func(o *serverOptions) { o.allowedOrigins = origins }
 }
 
 // WithMaxMessageSize sets the maximum inbound message size in bytes (default 32KB).
 func WithMaxMessageSize(size int64) ServerOption {
-	return func(o *ServerOptions) { o.maxMessageSize = size }
+	return func(o *serverOptions) { o.maxMessageSize = size }
 }
 
 // WithAuthenticator sets a function to authenticate the HTTP request before WebSocket upgrade.
 func WithAuthenticator(fn func(r *http.Request) error) ServerOption {
-	return func(o *ServerOptions) { o.authenticator = fn }
+	return func(o *serverOptions) { o.authenticator = fn }
 }
 
 // WithConnIDExtractor sets a function to extract the connection ID from an HTTP request.
 func WithConnIDExtractor(fn func(r *http.Request) (string, error)) ServerOption {
-	return func(o *ServerOptions) { o.connIDExtractor = fn }
+	return func(o *serverOptions) { o.connIDExtractor = fn }
 }
 
 // WithOnUpgrade sets a unified upgrade hook that performs authentication, extracts
@@ -200,17 +203,17 @@ func WithConnIDExtractor(fn func(r *http.Request) (string, error)) ServerOption 
 // When set, WithAuthenticator and WithConnIDExtractor are ignored by HandleHTTP.
 // Return a non-nil error to reject the connection (HTTP 401).
 func WithOnUpgrade(fn func(r *http.Request) (*UpgradeInfo, error)) ServerOption {
-	return func(o *ServerOptions) { o.onUpgrade = fn }
+	return func(o *serverOptions) { o.onUpgrade = fn }
 }
 
 // WithMaxConnections sets the maximum number of concurrent WebSocket connections.
 func WithMaxConnections(n int64) ServerOption {
-	return func(o *ServerOptions) { o.maxConnections = n }
+	return func(o *serverOptions) { o.maxConnections = n }
 }
 
 // WithRateLimit configures per-connection inbound message rate limiting.
 func WithRateLimit(perSec float64, burst int) ServerOption {
-	return func(o *ServerOptions) {
+	return func(o *serverOptions) {
 		o.rateLimitPerSec = perSec
 		o.rateLimitBurst = burst
 	}
@@ -218,32 +221,32 @@ func WithRateLimit(perSec float64, burst int) ServerOption {
 
 // WithTokenProvider sets a TokenProvider for server-side reconnect token generation and validation.
 func WithTokenProvider(tp TokenProvider) ServerOption {
-	return func(o *ServerOptions) { o.tokenProvider = tp }
+	return func(o *serverOptions) { o.tokenProvider = tp }
 }
 
 // WithMessageParser sets a custom MessageParser for extracting message types from inbound data.
 func WithMessageParser(p MessageParser) ServerOption {
-	return func(o *ServerOptions) { o.messageParser = p }
+	return func(o *serverOptions) { o.messageParser = p }
 }
 
 // WithClusterRelay enables distributed mode with cross-node message routing.
 func WithClusterRelay(r ClusterRelay) ServerOption {
-	return func(o *ServerOptions) { o.clusterRelay = r }
+	return func(o *serverOptions) { o.clusterRelay = r }
 }
 
 // WithDrainTimeout sets the maximum time to drain pending messages on disconnect (default 5s).
 func WithDrainTimeout(d time.Duration) ServerOption {
-	return func(o *ServerOptions) { o.drainTimeout = d }
+	return func(o *serverOptions) { o.drainTimeout = d }
 }
 
 // WithLogger sets a structured logger for the Server and Hub.
 func WithLogger(l Logger) ServerOption {
-	return func(o *ServerOptions) { o.logger = l }
+	return func(o *serverOptions) { o.logger = l }
 }
 
 // WithMetrics sets a MetricsCollector for the Server and Hub.
 func WithMetrics(m MetricsCollector) ServerOption {
-	return func(o *ServerOptions) { o.metrics = m }
+	return func(o *serverOptions) { o.metrics = m }
 }
 
 // ── UpgradeOption configures per-connection upgrade behavior ────────────────
