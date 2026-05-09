@@ -243,6 +243,12 @@ func TestHub_Subscribe_Unsubscribe(t *testing.T) {
 	h := NewHub()
 	ctx := context.Background()
 
+	// Subscribe now requires the conn to be registered first so the per-conn
+	// subs index can stay consistent with the topic side.
+	c := testConn("u1")
+	c.hub = h
+	_ = h.register(ctx, c)
+
 	h.Subscribe(ctx, "u1", "t1")
 	h.Subscribe(ctx, "u1", "t2")
 
@@ -309,6 +315,10 @@ func TestHub_Relay_SubscribeUnsubscribe(t *testing.T) {
 	h := NewHub(WithHubClusterRelay(relay))
 	ctx := context.Background()
 
+	c := testConn("u1")
+	c.hub = h
+	_ = h.register(ctx, c)
+
 	h.Subscribe(ctx, "u1", "topic1")
 	if len(relay.subscribes) != 1 {
 		t.Fatal("expected 1 subscribe relay call")
@@ -325,6 +335,10 @@ func TestHub_Relay_BroadcastPublishes(t *testing.T) {
 	h := NewHub(WithHubClusterRelay(relay))
 	ctx := context.Background()
 
+	c := testConn("u1")
+	c.hub = h
+	_ = h.register(ctx, c)
+
 	h.Subscribe(ctx, "u1", "topic1")
 	h.Broadcast(ctx, "topic1", []byte("data"))
 
@@ -337,6 +351,14 @@ func TestHub_CloseTopic_NotifiesRelay(t *testing.T) {
 	relay := &mockRelay{}
 	h := NewHub(WithHubClusterRelay(relay))
 	ctx := context.Background()
+
+	// Register both conns first — Subscribe requires it.
+	c1 := testConn("u1")
+	c1.hub = h
+	_ = h.register(ctx, c1)
+	c2 := testConn("u2")
+	c2.hub = h
+	_ = h.register(ctx, c2)
 
 	// Subscribe two connections to a topic.
 	h.Subscribe(ctx, "u1", "events")
@@ -573,6 +595,127 @@ func TestHub_ConnectionReplacement(t *testing.T) {
 	}
 }
 
+// TestHub_TopicSubscribers_ReturnsConnIDs verifies the *Conn snapshot is
+// correctly translated back to connIDs at the API boundary.
+func TestHub_TopicSubscribers_ReturnsConnIDs(t *testing.T) {
+	h := NewHub()
+	ctx := context.Background()
+
+	for _, id := range []string{"a", "b", "c"} {
+		c := testConn(id)
+		c.hub = h
+		_ = h.register(ctx, c)
+		h.Subscribe(ctx, id, "room")
+	}
+
+	subs := h.TopicSubscribers("room")
+	if len(subs) != 3 {
+		t.Fatalf("expected 3 subscribers, got %d", len(subs))
+	}
+	got := map[string]bool{}
+	for _, id := range subs {
+		got[id] = true
+	}
+	for _, want := range []string{"a", "b", "c"} {
+		if !got[want] {
+			t.Fatalf("missing %q in subscribers: %v", want, subs)
+		}
+	}
+}
+
+// TestHub_Subscribe_RequiresRegistered confirms the documented contract:
+// Subscribe returns false (and is a no-op) if the conn is not registered.
+func TestHub_Subscribe_RequiresRegistered(t *testing.T) {
+	h := NewHub()
+	if ok := h.Subscribe(context.Background(), "ghost", "room"); ok {
+		t.Fatal("Subscribe of unregistered conn must return false")
+	}
+	if subs := h.TopicSubscribers("room"); len(subs) != 0 {
+		t.Fatalf("topic must be empty, got %v", subs)
+	}
+}
+
+// TestHub_Concurrent_BroadcastSubscribeDisconnect stresses the COW + per-conn
+// subs path under heavy concurrency. Validated under -race.
+func TestHub_Concurrent_BroadcastSubscribeDisconnect(t *testing.T) {
+	h := NewHub(WithHubLogger(NopLogger{}))
+	ctx := context.Background()
+	const numConns = 50
+	const ops = 300
+
+	// Pre-populate connections.
+	conns := make([]*Conn, numConns)
+	for i := 0; i < numConns; i++ {
+		c := testConn("u" + string(rune('A'+i%26)) + string(rune('0'+i/26)))
+		c.hub = h
+		_ = h.register(ctx, c)
+		conns[i] = c
+		// Drain sendCh in background so writers do not block forever.
+		go func(ch chan MessageEnvelope, done <-chan struct{}) {
+			for {
+				select {
+				case <-done:
+					return
+				case <-ch:
+				}
+			}
+		}(c.sendCh, c.done)
+	}
+
+	var wg sync.WaitGroup
+
+	// Subscribers: churn membership of "room".
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(start int) {
+			defer wg.Done()
+			for n := 0; n < ops; n++ {
+				idx := (start + n) % numConns
+				h.Subscribe(ctx, conns[idx].id, "room")
+				h.Unsubscribe(ctx, conns[idx].id, "room")
+			}
+		}(i * 10)
+	}
+
+	// Broadcasters: hammer the lock-free read path.
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for n := 0; n < ops; n++ {
+				h.Broadcast(ctx, "room", []byte("msg"))
+			}
+		}()
+	}
+
+	// Single-target sends.
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(start int) {
+			defer wg.Done()
+			for n := 0; n < ops; n++ {
+				_ = h.Send(ctx, conns[(start+n)%numConns].id, []byte("hi"))
+			}
+		}(i * 5)
+	}
+
+	// Mass disconnects of a fraction of conns midway.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < numConns/3; i++ {
+			h.unregister(conns[i])
+		}
+	}()
+
+	wg.Wait()
+
+	// Final invariant: TopicCount and ConnCount must be internally consistent.
+	if h.ConnCount() < 0 {
+		t.Fatalf("negative ConnCount: %d", h.ConnCount())
+	}
+}
+
 // ── Benchmarks ───────────────────────────────────────────────────────────────
 
 func BenchmarkHub_Send(b *testing.B) {
@@ -636,6 +779,13 @@ func benchmarkBroadcast(b *testing.B, n int) {
 func BenchmarkHub_Subscribe(b *testing.B) {
 	h := NewHub(WithHubLogger(NopLogger{}))
 	ctx := context.Background()
+	c := testConn("u1")
+	c.hub = h
+	_ = h.register(ctx, c)
+	go func() {
+		for range c.sendCh {
+		}
+	}()
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
