@@ -446,9 +446,11 @@ func (h *Hub) broadcastDirect(ctx context.Context, topic string, data []byte, ex
 		return
 	}
 
-	// Single allocation shared across all online subscribers. enqueueShared
-	// stores the same MessageEnvelope on every conn's sendCh; writePump
-	// only reads Data, never mutates, so sharing is safe.
+	// Single allocation shared across every consumer of this broadcast:
+	//   - enqueueShared puts the same MessageEnvelope on each online
+	//     subscriber's sendCh; writePump only reads Data before ws.Write.
+	//   - The overflow path below also reuses cp as PendingMessage.Data.
+	// Sharing is safe because none of the consumers mutate the slice.
 	cp := make([]byte, len(data))
 	copy(cp, data)
 	env := MessageEnvelope{Data: cp, MsgType: websocket.MessageText}
@@ -466,9 +468,7 @@ func (h *Hub) broadcastDirect(ctx context.Context, topic string, data []byte, ex
 		// message survives across reconnects.
 		if h.pendingStore != nil {
 			c.markOverflow()
-			pendingCp := make([]byte, len(data))
-			copy(pendingCp, data)
-			pm := PendingMessage{Data: pendingCp, MsgType: MsgTypeText}
+			pm := PendingMessage{Data: cp, MsgType: MsgTypeText}
 			if err := h.pendingStore.PushEnvelope(ctx, c.id, pm); err != nil {
 				h.logger.Warn("broadcast: overflow push failed", "topic", topic, "connID", c.id, "error", err)
 				h.metrics.IncDrops()
