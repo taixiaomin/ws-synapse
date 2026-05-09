@@ -55,6 +55,18 @@ type Conn struct {
 	overflow atomic.Bool // true when PendingStore has overflow messages to drain
 	hub      *Hub        // back-reference injected by Hub.register()
 	info     *ConnInfo   // HTTP handshake snapshot; nil if not set
+
+	// subs records the topics this connection is subscribed to.
+	//
+	// Why a per-connection set: keeping the reverse index on the Conn itself
+	// (instead of a global Hub.connTopics map) lets unsubscribeAll iterate
+	// only this conn's topics without contending on a Hub-wide write lock.
+	// Under a mass-disconnect storm (1000s of conns dropping at once) the
+	// old design serialised every cleanup on a single Hub mutex; with subs
+	// kept per-Conn each goroutine touches only its own subsMu plus the
+	// per-topic locks, so cleanup scales linearly.
+	subsMu sync.Mutex
+	subs   map[string]struct{}
 }
 
 // markOverflow signals that overflow messages have been pushed to PendingStore.
@@ -65,6 +77,45 @@ func (c *Conn) HasOverflow() bool { return c.overflow.Load() }
 
 // clearOverflow resets the overflow flag after all overflow messages are drained.
 func (c *Conn) clearOverflow() { c.overflow.Store(false) }
+
+// addSub records that this connection has joined topic.
+// Caller must already hold the topic's writeMu so that the per-conn subs set
+// stays consistent with the topic's member set.
+func (c *Conn) addSub(topic string) {
+	c.subsMu.Lock()
+	if c.subs == nil {
+		c.subs = make(map[string]struct{})
+	}
+	c.subs[topic] = struct{}{}
+	c.subsMu.Unlock()
+}
+
+// removeSub clears a single topic from this connection's set.
+func (c *Conn) removeSub(topic string) {
+	c.subsMu.Lock()
+	delete(c.subs, topic)
+	c.subsMu.Unlock()
+}
+
+// drainSubs atomically takes the entire set of subscriptions and clears it.
+// Used by Hub.unsubscribeAll on disconnect: a single lock acquisition snapshots
+// the topics and resets the field, after which iteration runs lock-free.
+func (c *Conn) drainSubs() map[string]struct{} {
+	c.subsMu.Lock()
+	s := c.subs
+	c.subs = nil
+	c.subsMu.Unlock()
+	return s
+}
+
+// SubsCount returns the number of topics this connection is subscribed to.
+// Intended for diagnostics and tests.
+func (c *Conn) SubsCount() int {
+	c.subsMu.Lock()
+	l := len(c.subs)
+	c.subsMu.Unlock()
+	return l
+}
 
 func NewConn(id, token string, ws *websocket.Conn, chSize int, limiter *rate.Limiter) *Conn {
 	return &Conn{
