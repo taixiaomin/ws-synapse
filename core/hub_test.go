@@ -103,10 +103,11 @@ func (m *mockRelay) PublishBroadcast(_ context.Context, topic string, _ []byte, 
 
 func testConn(id string) *Conn {
 	return &Conn{
-		id:      id,
-		sendCh:  make(chan MessageEnvelope, 256),
-		done:    make(chan struct{}),
-		drained: make(chan struct{}),
+		id:          id,
+		sendCh:      make(chan MessageEnvelope, 256),
+		done:        make(chan struct{}),
+		drained:     make(chan struct{}),
+		overflowSig: make(chan struct{}, 1),
 	}
 }
 
@@ -480,10 +481,11 @@ func TestHub_Send_OverflowToPending(t *testing.T) {
 	h := NewHub(WithHubPendingStore(ps))
 	// Create a connection with sendCh size=1 to easily trigger overflow.
 	c := &Conn{
-		id:      "u1",
-		sendCh:  make(chan MessageEnvelope, 1),
-		done:    make(chan struct{}),
-		drained: make(chan struct{}),
+		id:          "u1",
+		sendCh:      make(chan MessageEnvelope, 1),
+		done:        make(chan struct{}),
+		drained:     make(chan struct{}),
+		overflowSig: make(chan struct{}, 1),
 	}
 	c.hub = h
 	_ = h.register(context.Background(), c)
@@ -512,7 +514,7 @@ func TestHub_Send_OverflowToPending(t *testing.T) {
 	}
 
 	// Verify overflow flag is set.
-	if !c.HasOverflow() {
+	if !c.hasOverflow() {
 		t.Fatal("expected overflow flag to be set")
 	}
 }
@@ -522,10 +524,11 @@ func TestHub_Broadcast_OverflowToPending(t *testing.T) {
 	h := NewHub(WithHubPendingStore(ps))
 	// sendCh size=1.
 	c := &Conn{
-		id:      "u1",
-		sendCh:  make(chan MessageEnvelope, 1),
-		done:    make(chan struct{}),
-		drained: make(chan struct{}),
+		id:          "u1",
+		sendCh:      make(chan MessageEnvelope, 1),
+		done:        make(chan struct{}),
+		drained:     make(chan struct{}),
+		overflowSig: make(chan struct{}, 1),
 	}
 	c.hub = h
 	_ = h.register(context.Background(), c)
@@ -544,7 +547,7 @@ func TestHub_Broadcast_OverflowToPending(t *testing.T) {
 	if ps.count("u1") != 1 {
 		t.Fatalf("expected 1 in pending store, got %d", ps.count("u1"))
 	}
-	if !c.HasOverflow() {
+	if !c.hasOverflow() {
 		t.Fatal("expected overflow flag to be set")
 	}
 }
