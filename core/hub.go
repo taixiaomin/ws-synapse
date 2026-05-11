@@ -332,8 +332,11 @@ func (h *Hub) Send(ctx context.Context, connID string, data []byte) error {
 			return nil
 		}
 		if h.pendingStore != nil {
-			c.markOverflow()
-			return h.pendingStore.PushEnvelope(ctx, connID, PendingMessage{Data: data, MsgType: MsgTypeText})
+			err := h.pendingStore.PushEnvelope(ctx, connID, PendingMessage{Data: data, MsgType: MsgTypeText})
+			if err == nil {
+				c.signalOverflow()
+			}
+			return err
 		}
 		h.logger.Warn("send channel full", "connID", connID)
 		h.metrics.IncDrops()
@@ -366,8 +369,11 @@ func (h *Hub) SendBinary(ctx context.Context, connID string, data []byte) error 
 			return nil
 		}
 		if h.pendingStore != nil {
-			c.markOverflow()
-			return h.pendingStore.PushEnvelope(ctx, connID, PendingMessage{Data: data, MsgType: MsgTypeBinary})
+			err := h.pendingStore.PushEnvelope(ctx, connID, PendingMessage{Data: data, MsgType: MsgTypeBinary})
+			if err == nil {
+				c.signalOverflow()
+			}
+			return err
 		}
 		h.logger.Warn("sendBinary channel full", "connID", connID)
 		h.metrics.IncDrops()
@@ -467,11 +473,12 @@ func (h *Hub) broadcastDirect(ctx context.Context, topic string, data []byte, ex
 		// sendCh full or conn already closed — buffer to PendingStore so the
 		// message survives across reconnects.
 		if h.pendingStore != nil {
-			c.markOverflow()
 			pm := PendingMessage{Data: cp, MsgType: MsgTypeText}
 			if err := h.pendingStore.PushEnvelope(ctx, c.id, pm); err != nil {
 				h.logger.Warn("broadcast: overflow push failed", "topic", topic, "connID", c.id, "error", err)
 				h.metrics.IncDrops()
+			} else {
+				c.signalOverflow()
 			}
 			continue
 		}
@@ -908,8 +915,11 @@ func (h *Hub) LocalSend(ctx context.Context, connID string, data []byte) error {
 			return nil
 		}
 		if h.pendingStore != nil {
-			c.markOverflow()
-			return h.pendingStore.Push(ctx, connID, data)
+			err := h.pendingStore.Push(ctx, connID, data)
+			if err == nil {
+				c.signalOverflow()
+			}
+			return err
 		}
 		h.metrics.IncDrops()
 		return ErrSendChannelFull

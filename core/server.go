@@ -392,10 +392,18 @@ func (s *Server) writePump(ctx context.Context, c *Conn) {
 				s.metrics.IncMessagesOut()
 			}
 
-			// After draining sendCh, check for overflow messages in PendingStore.
-			if c.HasOverflow() {
-				s.drainOverflow(ctx, c)
+		case <-c.overflowSig:
+			// Flush any in-flight sendCh entries first so overflow messages
+			// don't get written ahead of them. Select's pseudo-random choice
+			// could otherwise pick this case while sendCh still has buffered
+			// items; this loop restores best-effort relative ordering.
+			for n := len(c.sendCh); n > 0; n-- {
+				if err := c.WriteEnvelope(ctx, <-c.sendCh, s.opts.writeTimeout); err != nil {
+					return
+				}
+				s.metrics.IncMessagesOut()
 			}
+			s.drainOverflow(ctx, c)
 
 		case <-ticker.C:
 			pingCtx, cancel := context.WithTimeout(ctx, s.opts.writeTimeout)
@@ -440,41 +448,51 @@ func (s *Server) drainToPending(c *Conn) {
 	}
 }
 
-// drainOverflow pulls overflow messages from PendingStore and writes them to the WebSocket.
-// Called by writePump after sendCh is drained when the overflow flag is set.
+// drainOverflow pulls overflow messages from PendingStore and writes them to the
+// WebSocket. Called by writePump when overflowSig fires. Loops until PopAll
+// returns empty so messages pushed during the drain are picked up in the same
+// activation. Any early-exit path re-signals overflowSig so the next select
+// turn retries.
 func (s *Server) drainOverflow(ctx context.Context, c *Conn) {
 	if s.hub.pendingStore == nil {
-		c.clearOverflow()
 		return
 	}
-	msgs, err := s.hub.pendingStore.PopAll(ctx, c.ID())
-	if err != nil {
-		s.hub.logger.Warn("drainOverflow: PopAll failed", "connID", c.ID(), "error", err)
-		return // Don't clear overflow — retry on next sendCh drain.
-	}
-	if len(msgs) == 0 {
-		c.clearOverflow()
-		return
-	}
-	for i, m := range msgs {
-		msgType := websocket.MessageText
-		if m.MsgType == MsgTypeBinary {
-			msgType = websocket.MessageBinary
-		}
-		env := MessageEnvelope{Data: m.Data, MsgType: msgType}
-		if err := c.WriteEnvelope(ctx, env, s.opts.writeTimeout); err != nil {
-			// Write failed — re-push remaining messages back to PendingStore.
-			for _, remaining := range msgs[i:] {
-				if pushErr := s.hub.pendingStore.PushEnvelope(ctx, c.ID(), remaining); pushErr != nil {
-					s.hub.logger.Error("drainOverflow: re-push failed", "connID", c.ID(), "error", pushErr)
-					return
-				}
-			}
+	for {
+		msgs, err := s.hub.pendingStore.PopAll(ctx, c.ID())
+		if err != nil {
+			s.hub.logger.Warn("drainOverflow: PopAll failed", "connID", c.ID(), "error", err)
+			c.signalOverflow() // retry next turn
 			return
 		}
-		s.metrics.IncMessagesOut()
+		if len(msgs) == 0 {
+			return
+		}
+		for i, m := range msgs {
+			msgType := websocket.MessageText
+			if m.MsgType == MsgTypeBinary {
+				msgType = websocket.MessageBinary
+			}
+			env := MessageEnvelope{Data: m.Data, MsgType: msgType}
+			if err := c.WriteEnvelope(ctx, env, s.opts.writeTimeout); err != nil {
+				// Write failed — re-push remaining messages back to PendingStore
+				// and re-signal so we retry once the next writer turn comes.
+				rePushed := true
+				for _, remaining := range msgs[i:] {
+					if pushErr := s.hub.pendingStore.PushEnvelope(ctx, c.ID(), remaining); pushErr != nil {
+						s.hub.logger.Error("drainOverflow: re-push failed", "connID", c.ID(), "error", pushErr)
+						s.metrics.IncDrops()
+						rePushed = false
+						break
+					}
+				}
+				if rePushed {
+					c.signalOverflow()
+				}
+				return
+			}
+			s.metrics.IncMessagesOut()
+		}
 	}
-	c.clearOverflow()
 }
 
 // envelopeToMsgType converts a websocket.MessageType to the PendingMessage MsgType constant.

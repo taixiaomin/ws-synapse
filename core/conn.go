@@ -8,7 +8,6 @@ import (
 	"net/url"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -52,9 +51,9 @@ type Conn struct {
 	isReconnect bool          // true if connection was established via token reconnect
 	limiter     *rate.Limiter // per-connection inbound rate limiter; nil = unlimited
 
-	overflow atomic.Bool // true when PendingStore has overflow messages to drain
-	hub      *Hub        // back-reference injected by Hub.register()
-	info     *ConnInfo   // HTTP handshake snapshot; nil if not set
+	overflowSig chan struct{} // buffered(1) wake signal; non-empty iff PendingStore may have overflow to drain
+	hub         *Hub          // back-reference injected by Hub.register()
+	info        *ConnInfo     // HTTP handshake snapshot; nil if not set
 
 	// subs records the topics this connection is subscribed to.
 	//
@@ -69,14 +68,23 @@ type Conn struct {
 	subs   map[string]struct{}
 }
 
-// markOverflow signals that overflow messages have been pushed to PendingStore.
-func (c *Conn) markOverflow() { c.overflow.Store(true) }
+// signalOverflow wakes writePump to drain PendingStore. Callers must invoke
+// this only AFTER PushEnvelope has succeeded — the invariant is that whenever
+// the store may have data, a signal is either pending in overflowSig or being
+// processed by drainOverflow.
+func (c *Conn) signalOverflow() {
+	select {
+	case c.overflowSig <- struct{}{}:
+	default:
+	}
+}
 
-// HasOverflow reports whether there are overflow messages in PendingStore.
-func (c *Conn) HasOverflow() bool { return c.overflow.Load() }
-
-// clearOverflow resets the overflow flag after all overflow messages are drained.
-func (c *Conn) clearOverflow() { c.overflow.Store(false) }
+// hasOverflow reports whether a wake signal is currently pending.
+// Non-destructive — intended for tests and diagnostics; writePump consumes
+// the signal directly via its select on overflowSig.
+func (c *Conn) hasOverflow() bool {
+	return len(c.overflowSig) > 0
+}
 
 // addSub records that this connection has joined topic.
 // Caller must already hold the topic's writeMu so that the per-conn subs set
@@ -119,13 +127,14 @@ func (c *Conn) SubsCount() int {
 
 func NewConn(id, token string, ws *websocket.Conn, chSize int, limiter *rate.Limiter) *Conn {
 	return &Conn{
-		id:      id,
-		token:   token,
-		ws:      ws,
-		sendCh:  make(chan MessageEnvelope, chSize),
-		done:    make(chan struct{}),
-		drained: make(chan struct{}),
-		limiter: limiter,
+		id:          id,
+		token:       token,
+		ws:          ws,
+		sendCh:      make(chan MessageEnvelope, chSize),
+		done:        make(chan struct{}),
+		drained:     make(chan struct{}),
+		overflowSig: make(chan struct{}, 1),
+		limiter:     limiter,
 	}
 }
 
