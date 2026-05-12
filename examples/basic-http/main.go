@@ -85,7 +85,6 @@ func main() {
 				return nil, fmt.Errorf("missing id")
 			}
 			return &ws.UpgradeInfo{
-				ConnID: connID,
 				Metadata: map[string]interface{}{
 					"role": r.URL.Query().Get("role"),
 				},
