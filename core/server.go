@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/google/uuid"
 	"golang.org/x/time/rate"
 )
 
@@ -108,11 +109,11 @@ func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 			jsonError(w, err.Error(), http.StatusUnauthorized)
 			return
 		}
-		if info == nil || info.ConnID == "" {
+		if info == nil {
 			jsonError(w, "connection id is required", http.StatusBadRequest)
 			return
 		}
-		s.upgrade(w, r, info.ConnID, nil, info.Metadata)
+		s.upgrade(w, r, uuid.New().String(), nil, info.Metadata)
 		return
 	}
 
@@ -132,11 +133,8 @@ func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 
 // Upgrade handles the WebSocket upgrade from any HTTP handler.
 // connID must be pre-extracted by the caller. This method is framework-agnostic.
-func (s *Server) Upgrade(w http.ResponseWriter, r *http.Request, connID string, opts ...UpgradeOption) {
-	if connID == "" {
-		jsonError(w, "connection id is required", http.StatusBadRequest)
-		return
-	}
+func (s *Server) Upgrade(w http.ResponseWriter, r *http.Request, opts ...UpgradeOption) {
+	connID := uuid.New().String()
 
 	var uo *upgradeOpts
 	if len(opts) > 0 {
@@ -151,11 +149,8 @@ func (s *Server) Upgrade(w http.ResponseWriter, r *http.Request, connID string, 
 
 // UpgradeWithMeta handles the WebSocket upgrade with additional metadata to inject.
 // connID must be pre-extracted by the caller.
-func (s *Server) UpgradeWithMeta(w http.ResponseWriter, r *http.Request, connID string, metadata map[string]interface{}, opts ...UpgradeOption) {
-	if connID == "" {
-		jsonError(w, "connection id is required", http.StatusBadRequest)
-		return
-	}
+func (s *Server) UpgradeWithMeta(w http.ResponseWriter, r *http.Request, metadata map[string]interface{}, opts ...UpgradeOption) {
+	connID := uuid.New().String()
 
 	var uo *upgradeOpts
 	if len(opts) > 0 {

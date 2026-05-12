@@ -37,7 +37,7 @@ type MessageEnvelope struct {
 // Business code receives *Conn in event callbacks and can call Send, Set/Get
 // metadata, and inspect connection properties via getter methods.
 type Conn struct {
-	id    string // unique client identifier (e.g., userID)
+	id    string // unique client identifier
 	token string // reconnection token — server-generated
 
 	ws          *websocket.Conn
