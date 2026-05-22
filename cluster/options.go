@@ -13,6 +13,7 @@ const (
 	defaultStreamMaxLen      = 1000
 	defaultKeyPrefix         = "ws:"
 	defaultBlockDuration     = 5 * time.Second
+	defaultTopicSharedTTL    = 5 * time.Second
 	defaultGroupName         = "relay"
 )
 
@@ -49,6 +50,12 @@ func WithBlockDuration(d time.Duration) Option {
 // WithKeyPrefix sets the Redis key prefix (default "ws:").
 func WithKeyPrefix(prefix string) Option {
 	return func(r *RedisClusterRelay) { r.keyPrefix = prefix }
+}
+
+// WithTopicSharedTTL sets how long PublishBroadcast may trust a cached
+// local-only/shared topic decision before refreshing via SMembers.
+func WithTopicSharedTTL(d time.Duration) Option {
+	return func(r *RedisClusterRelay) { r.topicSharedTTL = d }
 }
 
 // WithLogger sets the logger for the relay. Compatible with core.Logger.

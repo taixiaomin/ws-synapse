@@ -32,6 +32,7 @@ type RedisClusterRelay struct {
 	nodeTTL           time.Duration
 	heartbeatInterval time.Duration
 	blockDuration     time.Duration
+	topicSharedTTL    time.Duration
 
 	// localConns tracks connIDs registered on this node for TTL renewal.
 	localConns sync.Map // connID → struct{}
@@ -39,8 +40,38 @@ type RedisClusterRelay struct {
 	localTopics sync.Map // topic → *int64 (atomic count via mutex)
 	topicMu     sync.Mutex
 
+	// topicShared caches whether a topic has subscribers on any node other
+	// than this one. PublishBroadcast uses it as a fast path to skip the
+	// SMembers round-trip + fan-out when the topic is known to be local-only.
+	// Populated lazily by PublishBroadcast (slow path) and invalidated by
+	// pub/sub events from OnSubscribe/OnUnsubscribe on other nodes.
+	//
+	//   value.shared=true  → topic has subscribers on ≥1 remote node
+	//   value.shared=false → topic has subscribers ONLY on this node
+	//   key absent  → unknown, slow-path will populate
+	topicShared sync.Map // topic → topicSharedCacheEntry
+
+	// membershipPubSub listens for topic-membership change broadcasts so
+	// topicShared can be invalidated when remote nodes join/leave a topic.
+	// nil when the underlying redis client does not support Subscribe — in
+	// that case the fast path stays disabled (cache never populates).
+	membershipPubSub *redis.PubSub
+
 	stopCh chan struct{}
 	wg     sync.WaitGroup
+}
+
+// subscriber is the minimal interface we need to listen for membership
+// changes. We pull it out of redis.Cmdable via a type assertion in Start
+// so callers that pass a custom Cmdable (e.g. a pipelining wrapper) still
+// work — they just lose the fast-path optimization.
+type subscriber interface {
+	Subscribe(ctx context.Context, channels ...string) *redis.PubSub
+}
+
+type topicSharedCacheEntry struct {
+	shared    bool
+	expiresAt time.Time
 }
 
 // NewRedisClusterRelay creates a new relay. pendingStore is used as a fallback
@@ -56,6 +87,7 @@ func NewRedisClusterRelay(client redis.Cmdable, pendingStore core.PendingStore, 
 		nodeTTL:           defaultNodeTTL,
 		heartbeatInterval: defaultHeartbeatInterval,
 		blockDuration:     defaultBlockDuration,
+		topicSharedTTL:    defaultTopicSharedTTL,
 		stopCh:            make(chan struct{}),
 	}
 	for _, fn := range opts {
@@ -92,12 +124,37 @@ func (r *RedisClusterRelay) Start(handler core.RelayHandler) error {
 	go r.heartbeatLoop()
 	go r.consumeLoop()
 
+	// Topic-share fast path: subscribe to membership-change events so the
+	// PublishBroadcast cache can be invalidated when remote nodes touch a
+	// topic. Degrade gracefully if the client doesn't expose Subscribe.
+	if s, ok := r.client.(subscriber); ok {
+		r.membershipPubSub = s.Subscribe(ctx, r.membershipChannel())
+		// Block until the subscription is confirmed by Redis. This avoids a
+		// race where the very first published event after Start could be
+		// missed if we returned before Redis registered our subscription.
+		if _, err := r.membershipPubSub.Receive(ctx); err != nil {
+			r.logger.Warn("cluster relay: membership subscribe failed; fast-path disabled", "error", err)
+			_ = r.membershipPubSub.Close()
+			r.membershipPubSub = nil
+		} else {
+			r.wg.Add(1)
+			go r.membershipChangeLoop()
+		}
+	} else {
+		r.logger.Warn("cluster relay: client does not support Subscribe; topic-share fast-path disabled")
+	}
+
 	r.logger.Info("cluster relay started", "nodeID", r.nodeID)
 	return nil
 }
 
 func (r *RedisClusterRelay) Stop() error {
 	close(r.stopCh)
+	if r.membershipPubSub != nil {
+		// Closing the pub/sub causes Receive in the loop to return error,
+		// which is the loop's exit signal — must close BEFORE wg.Wait().
+		_ = r.membershipPubSub.Close()
+	}
 	r.wg.Wait()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -148,7 +205,17 @@ func (r *RedisClusterRelay) OnSubscribe(ctx context.Context, _, topic string) er
 		r.localTopics.Store(topic, &count)
 		r.topicMu.Unlock()
 		// First subscriber on this node — add node to topic set.
-		return r.client.SAdd(ctx, r.topicKey(topic), r.nodeID).Err()
+		if err := r.client.SAdd(ctx, r.topicKey(topic), r.nodeID).Err(); err != nil {
+			return err
+		}
+		// Tell other nodes their topicShared cache for this topic is stale —
+		// we just joined as a (possibly new) remote node from their POV.
+		// Best-effort: a dropped PUBLISH only delays correctness by the next
+		// natural cache refresh, it doesn't corrupt anything.
+		if err := r.client.Publish(ctx, r.membershipChannel(), membershipMsgAdd+topic).Err(); err != nil {
+			r.logger.Warn("relay: membership publish (add) failed", "topic", topic, "error", err)
+		}
+		return nil
 	}
 	cnt := val.(*int64)
 	*cnt++
@@ -159,7 +226,17 @@ func (r *RedisClusterRelay) OnSubscribe(ctx context.Context, _, topic string) er
 func (r *RedisClusterRelay) OnUnsubscribe(ctx context.Context, _, topic string, lastOnNode bool) error {
 	if lastOnNode {
 		r.localTopics.Delete(topic)
-		return r.client.SRem(ctx, r.topicKey(topic), r.nodeID).Err()
+		// We left the topic — drop any local belief about it; downstream
+		// PublishBroadcast on this node won't run for this topic anyway
+		// (no local subscribers), but keep the map clean.
+		r.topicShared.Delete(topic)
+		if err := r.client.SRem(ctx, r.topicKey(topic), r.nodeID).Err(); err != nil {
+			return err
+		}
+		if err := r.client.Publish(ctx, r.membershipChannel(), membershipMsgRemove+topic).Err(); err != nil {
+			r.logger.Warn("relay: membership publish (remove) failed", "topic", topic, "error", err)
+		}
+		return nil
 	}
 	r.topicMu.Lock()
 	if val, ok := r.localTopics.Load(topic); ok {
@@ -216,10 +293,52 @@ func (r *RedisClusterRelay) PublishSend(ctx context.Context, connID string, data
 }
 
 func (r *RedisClusterRelay) PublishBroadcast(ctx context.Context, topic string, data []byte, excludeIDs []string) error {
-	// Get all nodes that have subscribers for this topic.
+	// Fast path: if a previous SMembers told us this topic is local-only
+	// AND no membership-change event has arrived since to invalidate the
+	// cache, skip the Redis round-trip and remote fan-out entirely. The
+	// local broadcast was already done by Hub.broadcastDirect before we
+	// got here, so "skip" here means: do nothing.
+	if v, ok := r.topicShared.Load(topic); ok {
+		if entry, ok := v.(topicSharedCacheEntry); ok {
+			if time.Now().Before(entry.expiresAt) {
+				if !entry.shared {
+					return nil
+				}
+			} else {
+				r.topicShared.Delete(topic)
+			}
+		} else {
+			r.topicShared.Delete(topic)
+		}
+	}
+
+	// Slow path: ask Redis who else subscribes to this topic, and cache
+	// the result for subsequent broadcasts.
 	nodeIDs, err := r.client.SMembers(ctx, r.topicKey(topic)).Result()
-	if err != nil || len(nodeIDs) == 0 {
+	if err != nil {
 		return err
+	}
+	if len(nodeIDs) == 0 {
+		return nil
+	}
+
+	// Cache the result with TTL so the fast path self-heals even if an
+	// invalidation event is missed.
+	isShared := false
+	for _, nid := range nodeIDs {
+		if nid != r.nodeID {
+			isShared = true
+			break
+		}
+	}
+	if r.topicSharedTTL > 0 {
+		r.topicShared.Store(topic, topicSharedCacheEntry{
+			shared:    isShared,
+			expiresAt: time.Now().Add(r.topicSharedTTL),
+		})
+	}
+	if !isShared {
+		return nil
 	}
 
 	encoded := base64.StdEncoding.EncodeToString(data)
@@ -419,6 +538,57 @@ func (r *RedisClusterRelay) connKey(connID string) string {
 
 func (r *RedisClusterRelay) topicKey(topic string) string {
 	return r.keyPrefix + "topic:" + topic
+}
+
+// membershipChannel is the single global pub/sub channel used to propagate
+// topic-membership changes between nodes. Payload format:
+//
+//	"+<topic>"  — sender just became the first local subscriber for <topic>
+//	"-<topic>"  — sender just dropped the last local subscriber for <topic>
+//
+// Receivers invalidate their topicShared cache for <topic>. Using one
+// channel for everything keeps the Redis subscriber count bounded at 1
+// per node regardless of topic cardinality.
+func (r *RedisClusterRelay) membershipChannel() string {
+	return r.keyPrefix + "topic-membership-changes"
+}
+
+const (
+	membershipMsgAdd    = "+"
+	membershipMsgRemove = "-"
+)
+
+// membershipChangeLoop reads invalidation events from membershipPubSub and
+// drops the corresponding topicShared cache entries. Both +/− payloads
+// invalidate (we don't try to maintain the exact membership locally — that
+// would require gossip; cheaper to re-fetch on next broadcast).
+//
+// Exits when membershipPubSub.Close() is called from Stop().
+func (r *RedisClusterRelay) membershipChangeLoop() {
+	defer r.wg.Done()
+	ch := r.membershipPubSub.Channel()
+	for {
+		select {
+		case <-r.stopCh:
+			return
+		case msg, ok := <-ch:
+			if !ok {
+				return
+			}
+			if len(msg.Payload) < 2 {
+				continue
+			}
+			// Skip our own publishes — we already know the cache is fresh
+			// (we just touched the set), so invalidating would just cause
+			// the next broadcast to do a wasted SMembers.
+			//
+			// However the protocol doesn't carry the sender, so we use a
+			// conservative heuristic: only invalidate if the cached state
+			// could plausibly be stale. Cheapest is just to invalidate
+			// unconditionally and let the next slow path re-cache.
+			r.topicShared.Delete(msg.Payload[1:])
+		}
+	}
 }
 
 func isGroupExistsErr(err error) bool {

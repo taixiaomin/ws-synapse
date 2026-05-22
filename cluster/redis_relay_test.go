@@ -118,6 +118,10 @@ func setupMiniredis(t *testing.T) (*miniredis.Miniredis, *redis.Client) {
 	return mr, client
 }
 
+// noSubscribeClient intentionally exposes only redis.Cmdable so Start's
+// subscriber type assertion fails and membership invalidation stays disabled.
+type noSubscribeClient struct{ redis.Cmdable }
+
 func fastOpts() []Option {
 	return []Option{
 		WithHeartbeatInterval(100 * time.Millisecond),
@@ -603,5 +607,75 @@ func TestPublishSend_LocalNode_DeliversDirectly(t *testing.T) {
 	}
 	if string(sends[0].Data) != "local delivery" {
 		t.Errorf("expected 'local delivery', got %q", string(sends[0].Data))
+	}
+}
+
+func TestPublishBroadcast_TopicSharedTTLRefreshesWithoutMembershipPubSub(t *testing.T) {
+	_, client := setupMiniredis(t)
+
+	pending := newMockPendingStore()
+	handlerA := &mockRelayHandler{}
+	handlerB := &mockRelayHandler{}
+
+	// Relay A cannot Subscribe, so cache invalidation events are unavailable.
+	relayA := NewRedisClusterRelay(noSubscribeClient{Cmdable: client}, pending,
+		WithHeartbeatInterval(100*time.Millisecond),
+		WithConnTTL(5*time.Second),
+		WithNodeTTL(3*time.Second),
+		WithBlockDuration(200*time.Millisecond),
+		WithTopicSharedTTL(120*time.Millisecond),
+	)
+	relayB := NewRedisClusterRelay(client, pending,
+		WithHeartbeatInterval(100*time.Millisecond),
+		WithConnTTL(5*time.Second),
+		WithNodeTTL(3*time.Second),
+		WithBlockDuration(200*time.Millisecond),
+	)
+
+	if err := relayA.Start(handlerA); err != nil {
+		t.Fatalf("relayA.Start: %v", err)
+	}
+	if err := relayB.Start(handlerB); err != nil {
+		t.Fatalf("relayB.Start: %v", err)
+	}
+
+	ctx := context.Background()
+	topic := "room:ttl-fallback"
+
+	// Prime relayA cache as local-only.
+	if err := relayA.OnSubscribe(ctx, "conn-a", topic); err != nil {
+		t.Fatalf("relayA.OnSubscribe: %v", err)
+	}
+	if err := relayA.PublishBroadcast(ctx, topic, []byte("prime"), nil); err != nil {
+		t.Fatalf("relayA.PublishBroadcast prime: %v", err)
+	}
+
+	// Remote node joins after cache is primed.
+	if err := relayB.OnSubscribe(ctx, "conn-b", topic); err != nil {
+		t.Fatalf("relayB.OnSubscribe: %v", err)
+	}
+
+	// Wait for local-only cache to expire, then broadcast again.
+	time.Sleep(180 * time.Millisecond)
+	payload := []byte("after-ttl")
+	if err := relayA.PublishBroadcast(ctx, topic, payload, nil); err != nil {
+		t.Fatalf("relayA.PublishBroadcast after ttl: %v", err)
+	}
+
+	ok := pollUntil(t, 6*time.Second, func() bool {
+		bcasts := handlerB.getBroadcasts()
+		for _, b := range bcasts {
+			if b.Topic == topic && string(b.Data) == string(payload) {
+				return true
+			}
+		}
+		return false
+	})
+
+	relayA.Stop()
+	relayB.Stop()
+
+	if !ok {
+		t.Fatal("timed out waiting for cross-node broadcast after topicShared TTL refresh")
 	}
 }
