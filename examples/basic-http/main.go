@@ -39,7 +39,7 @@ func (h *MyHandler) OnMessage(ctx context.Context, conn *ws.Conn, msg *ws.Messag
 		if !ok {
 			return conn.SendJSON(map[string]string{"error": "missing topic"})
 		}
-		conn.Hub().Subscribe(ctx, conn.ID(), topic)
+		conn.Subscribe(ctx, topic)
 		return conn.SendJSON(map[string]string{"status": "subscribed", "topic": topic})
 
 	case "ping":

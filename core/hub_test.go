@@ -192,8 +192,8 @@ func TestHub_Broadcast(t *testing.T) {
 	_ = h.register(ctx, c1)
 	_ = h.register(ctx, c2)
 
-	h.Subscribe(ctx, "u1", "room1")
-	h.Subscribe(ctx, "u2", "room1")
+	h.Subscribe(ctx, c1, "room1")
+	h.Subscribe(ctx, c2, "room1")
 
 	h.Broadcast(ctx, "room1", []byte("msg"))
 
@@ -219,8 +219,8 @@ func TestHub_BroadcastExclude(t *testing.T) {
 
 	_ = h.register(ctx, c1)
 	_ = h.register(ctx, c2)
-	h.Subscribe(ctx, "u1", "room1")
-	h.Subscribe(ctx, "u2", "room1")
+	h.Subscribe(ctx, c1, "room1")
+	h.Subscribe(ctx, c2, "room1")
 
 	h.BroadcastExclude(ctx, "room1", []byte("msg"), "u1")
 
@@ -250,15 +250,15 @@ func TestHub_Subscribe_Unsubscribe(t *testing.T) {
 	c.hub = h
 	_ = h.register(ctx, c)
 
-	h.Subscribe(ctx, "u1", "t1")
-	h.Subscribe(ctx, "u1", "t2")
+	h.Subscribe(ctx, c, "t1")
+	h.Subscribe(ctx, c, "t2")
 
 	topics := h.ConnTopics("u1")
 	if len(topics) != 2 {
 		t.Fatalf("expected 2 topics, got %d", len(topics))
 	}
 
-	h.Unsubscribe(ctx, "u1", "t1")
+	h.Unsubscribe(ctx, c, "t1")
 	topics = h.ConnTopics("u1")
 	if len(topics) != 1 {
 		t.Fatalf("expected 1 topic, got %d", len(topics))
@@ -320,12 +320,12 @@ func TestHub_Relay_SubscribeUnsubscribe(t *testing.T) {
 	c.hub = h
 	_ = h.register(ctx, c)
 
-	h.Subscribe(ctx, "u1", "topic1")
+	h.Subscribe(ctx, c, "topic1")
 	if len(relay.subscribes) != 1 {
 		t.Fatal("expected 1 subscribe relay call")
 	}
 
-	h.Unsubscribe(ctx, "u1", "topic1")
+	h.Unsubscribe(ctx, c, "topic1")
 	if len(relay.unsubscribes) != 1 {
 		t.Fatal("expected 1 unsubscribe relay call")
 	}
@@ -340,7 +340,7 @@ func TestHub_Relay_BroadcastPublishes(t *testing.T) {
 	c.hub = h
 	_ = h.register(ctx, c)
 
-	h.Subscribe(ctx, "u1", "topic1")
+	h.Subscribe(ctx, c, "topic1")
 	h.Broadcast(ctx, "topic1", []byte("data"))
 
 	if len(relay.broadcasts) != 1 || relay.broadcasts[0] != "topic1" {
@@ -362,8 +362,8 @@ func TestHub_CloseTopic_NotifiesRelay(t *testing.T) {
 	_ = h.register(ctx, c2)
 
 	// Subscribe two connections to a topic.
-	h.Subscribe(ctx, "u1", "events")
-	h.Subscribe(ctx, "u2", "events")
+	h.Subscribe(ctx, c1, "events")
+	h.Subscribe(ctx, c2, "events")
 
 	// Reset to isolate CloseTopic calls.
 	relay.mu.Lock()
@@ -416,8 +416,8 @@ func TestHub_UnsubscribeAll_NotifiesRelay(t *testing.T) {
 	ctx := context.Background()
 
 	_ = h.register(ctx, c)
-	h.Subscribe(ctx, "u1", "t1")
-	h.Subscribe(ctx, "u1", "t2")
+	h.Subscribe(ctx, c, "t1")
+	h.Subscribe(ctx, c, "t2")
 
 	// Reset to isolate unsubscribeAll calls.
 	relay.mu.Lock()
@@ -462,7 +462,7 @@ func TestHub_LocalBroadcast(t *testing.T) {
 	ctx := context.Background()
 
 	_ = h.register(ctx, c)
-	h.Subscribe(ctx, "u1", "room")
+	h.Subscribe(ctx, c, "room")
 
 	h.LocalBroadcast(ctx, "room", []byte("from-other-node"), nil)
 
@@ -532,7 +532,7 @@ func TestHub_Broadcast_OverflowToPending(t *testing.T) {
 	}
 	c.hub = h
 	_ = h.register(context.Background(), c)
-	h.Subscribe(context.Background(), "u1", "room")
+	h.Subscribe(context.Background(), c, "room")
 
 	ctx := context.Background()
 
@@ -608,7 +608,7 @@ func TestHub_TopicSubscribers_ReturnsConnIDs(t *testing.T) {
 		c := testConn(id)
 		c.hub = h
 		_ = h.register(ctx, c)
-		h.Subscribe(ctx, id, "room")
+		h.Subscribe(ctx, c, "room")
 	}
 
 	subs := h.TopicSubscribers("room")
@@ -630,7 +630,8 @@ func TestHub_TopicSubscribers_ReturnsConnIDs(t *testing.T) {
 // Subscribe returns false (and is a no-op) if the conn is not registered.
 func TestHub_Subscribe_RequiresRegistered(t *testing.T) {
 	h := NewHub()
-	if ok := h.Subscribe(context.Background(), "ghost", "room"); ok {
+	ghost := testConn("ghost") // built but intentionally NOT registered with h
+	if ok := h.Subscribe(context.Background(), ghost, "room"); ok {
 		t.Fatal("Subscribe of unregistered conn must return false")
 	}
 	if subs := h.TopicSubscribers("room"); len(subs) != 0 {
@@ -674,8 +675,8 @@ func TestHub_Concurrent_BroadcastSubscribeDisconnect(t *testing.T) {
 			defer wg.Done()
 			for n := 0; n < ops; n++ {
 				idx := (start + n) % numConns
-				h.Subscribe(ctx, conns[idx].id, "room")
-				h.Unsubscribe(ctx, conns[idx].id, "room")
+				h.Subscribe(ctx, conns[idx], "room")
+				h.Unsubscribe(ctx, conns[idx], "room")
 			}
 		}(i * 10)
 	}
@@ -763,7 +764,7 @@ func benchmarkBroadcast(b *testing.B, n int) {
 		c := testConn(string(rune('A'+i%26)) + string(rune('0'+i/26)))
 		c.hub = h
 		_ = h.register(ctx, c)
-		h.Subscribe(ctx, c.id, "room")
+		h.Subscribe(ctx, c, "room")
 		// Drain in background.
 		go func(ch chan MessageEnvelope) {
 			for range ch {
@@ -792,7 +793,7 @@ func BenchmarkHub_Subscribe(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		h.Subscribe(ctx, "u1", "topic")
-		h.Unsubscribe(ctx, "u1", "topic")
+		h.Subscribe(ctx, c, "topic")
+		h.Unsubscribe(ctx, c, "topic")
 	}
 }

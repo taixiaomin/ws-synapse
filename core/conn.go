@@ -105,6 +105,19 @@ func (c *Conn) removeSub(topic string) {
 	c.subsMu.Unlock()
 }
 
+// Subscribe is a convenience that delegates to c.hub.Subscribe(ctx, c, topic).
+// Use this from EventHandler callbacks (OnConnect / OnMessage) — it avoids
+// the conn.Hub().Subscribe(ctx, conn.ID(), topic) ceremony and makes the
+// "subscribe THIS connection" intent unambiguous.
+func (c *Conn) Subscribe(ctx context.Context, topic string) bool {
+	return c.hub.Subscribe(ctx, c, topic)
+}
+
+// Unsubscribe is the symmetric counterpart of Subscribe.
+func (c *Conn) Unsubscribe(ctx context.Context, topic string) {
+	c.hub.Unsubscribe(ctx, c, topic)
+}
+
 // drainSubs atomically takes the entire set of subscriptions and clears it.
 // Used by Hub.unsubscribeAll on disconnect: a single lock acquisition snapshots
 // the topics and resets the field, after which iteration runs lock-free.
