@@ -23,7 +23,6 @@ func jsonError(w http.ResponseWriter, msg string, code int) {
 // Server is the WebSocket entry point. It upgrades HTTP connections,
 // manages read/write pumps, and dispatches lifecycle events to the EventHandler.
 type Server struct {
-	gcid    int64
 	hub     *Hub
 	handler EventHandler
 	opts    serverOptions

@@ -526,18 +526,22 @@ func (h *Hub) BroadcastPreparedExclude(ctx context.Context, topic string, msg *P
 // Why no global write lock: only this topic's writeMu is taken. Subscribes to
 // different topics run fully in parallel; the only outer-lock acquisition is
 // the slow-path topic creation through getOrCreateTopic.
-func (h *Hub) Subscribe(ctx context.Context, connID, topic string) bool {
-	if h.closed.Load() {
+// Subscribe registers conn for the given topic. Pass the *Conn directly —
+// the old `Subscribe(ctx, connID string, topic string)` form invited callers
+// to substitute a business identifier (userID, etc.) for connID, since both
+// are strings; the type-safe form makes that mistake unrepresentable.
+//
+// Returns false when the Hub is closed or conn has already been unregistered
+// (subscribing a stale conn would leak an orphan members entry that nothing
+// could clean up).
+func (h *Hub) Subscribe(ctx context.Context, conn *Conn, topic string) bool {
+	if conn == nil || h.closed.Load() {
 		return false
 	}
-
-	val, ok := h.conns.Load(connID)
-	if !ok {
-		// Subscribing an unregistered conn would create a stale entry that
-		// nothing can clean up (no Conn to track it on). Reject explicitly.
+	if _, ok := h.conns.Load(conn.id); !ok {
+		// Stale Conn — already unregistered. Reject explicitly.
 		return false
 	}
-	c := val.(*Conn)
 
 	// Loop guard against a destroy race: getOrCreateTopic may hand us a
 	// *topicSubs that removeTopicIfEmpty marked destroyed before we could
@@ -551,70 +555,70 @@ func (h *Hub) Subscribe(ctx context.Context, connID, topic string) bool {
 			t.writeMu.Unlock()
 			continue
 		}
-		if _, already := t.members[connID]; already {
+		if _, already := t.members[conn.id]; already {
 			// Idempotent: avoid rebuilding the snapshot or firing a duplicate
 			// callback for a re-subscribe.
 			t.writeMu.Unlock()
 			return true
 		}
-		t.members[connID] = c
+		t.members[conn.id] = conn
 		t.rebuildSnapshot()
 		// Add to the conn's subs while we still hold writeMu so the two
 		// indexes (topic.members and conn.subs) stay consistent.
-		c.addSub(topic)
+		conn.addSub(topic)
 		t.writeMu.Unlock()
 		break
 	}
 
 	if h.topicHandler != nil {
-		h.topicHandler.OnSubscribe(ctx, connID, topic)
+		h.topicHandler.OnSubscribe(ctx, conn.id, topic)
 	}
 	if h.relay != nil {
-		if err := h.relay.OnSubscribe(ctx, connID, topic); err != nil {
-			h.logger.Warn("relay: subscribe failed", "connID", connID, "topic", topic, "error", err)
+		if err := h.relay.OnSubscribe(ctx, conn.id, topic); err != nil {
+			h.logger.Warn("relay: subscribe failed", "connID", conn.id, "topic", topic, "error", err)
 		}
 	}
 	return true
 }
 
-// Unsubscribe removes a connection from a topic.
-//
-// Note that Unsubscribe is also called by Hub on disconnect cleanup
-// (via unsubscribeAll) so it tolerates the connection being absent from
-// h.conns — only the topic side is required to exist.
-func (h *Hub) Unsubscribe(ctx context.Context, connID, topic string) {
+// Unsubscribe removes a connection from a topic. Pass the *Conn directly —
+// matching Subscribe's type-safe form. Safe to call on a Conn that has
+// already been drained by disconnect cleanup (removeSub is a no-op on a
+// nil/empty subs set).
+func (h *Hub) Unsubscribe(ctx context.Context, conn *Conn, topic string) {
+	if conn == nil {
+		return
+	}
 	t := h.getTopic(topic)
 	if t == nil {
 		return
 	}
 
 	t.writeMu.Lock()
-	if _, was := t.members[connID]; !was {
+	if _, was := t.members[conn.id]; !was {
 		t.writeMu.Unlock()
 		return
 	}
-	delete(t.members, connID)
+	delete(t.members, conn.id)
 	t.rebuildSnapshot()
 	isEmpty := len(t.members) == 0
 	t.writeMu.Unlock()
 
-	// Mirror the change on the conn's own set if it is still registered.
-	// During disconnect cleanup the conn may already be gone from h.conns;
-	// that's fine because unsubscribeAll already drained c.subs.
-	if val, ok := h.conns.Load(connID); ok {
-		val.(*Conn).removeSub(topic)
-	}
+	// Mirror the change on the conn's own subs set. No h.conns.Load needed
+	// since the caller already handed us *Conn — and removeSub tolerates a
+	// concurrently-drained subs map.
+	conn.removeSub(topic)
 
 	if isEmpty {
 		h.removeTopicIfEmpty(topic, t)
 	}
 
 	if h.topicHandler != nil {
-		h.topicHandler.OnUnsubscribe(ctx, connID, topic)
+		h.topicHandler.OnUnsubscribe(ctx, conn.id, topic)
 	}
 	if h.relay != nil {
-		if err := h.relay.OnUnsubscribe(ctx, connID, topic, isEmpty); err != nil {
-			h.logger.Warn("relay: unsubscribe failed", "connID", connID, "topic", topic, "error", err)
+		if err := h.relay.OnUnsubscribe(ctx, conn.id, topic, isEmpty); err != nil {
+			h.logger.Warn("relay: unsubscribe failed", "connID", conn.id, "topic", topic, "error", err)
 		}
 	}
 }
