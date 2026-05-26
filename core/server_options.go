@@ -94,6 +94,12 @@ type serverOptions struct {
 	// drain timeout for pending messages on disconnect (default 5s)
 	drainTimeout time.Duration
 
+	// per-message handle timeout passed to OnMessage as a derived ctx.
+	// Default 30s. Set to 0 to pass ctx through unchanged (no timeout).
+	// NOTE: this is a soft hint — readPump dispatches synchronously, so a
+	// handler that ignores ctx.Done() will still block readPump regardless.
+	messageHandleTimeout time.Duration
+
 	// logger, default slog-based logger
 	logger Logger
 
@@ -107,15 +113,16 @@ type ServerOption func(*serverOptions)
 // defaultServerOptions returns default options for a Server.
 func defaultServerOptions() serverOptions {
 	return serverOptions{
-		tokenParam:         "token",
-		sendChannelSize:    256,
-		writeTimeout:       10 * time.Second,
-		pingInterval:       54 * time.Second,
-		insecureSkipVerify: false,
-		maxMessageSize:     32 * 1024, // 32KB
-		rateLimitBurst:     10,
-		drainTimeout:       5 * time.Second,
-		logger:             defaultLogger(),
+		tokenParam:           "token",
+		sendChannelSize:      256,
+		writeTimeout:         10 * time.Second,
+		pingInterval:         54 * time.Second,
+		insecureSkipVerify:   false,
+		maxMessageSize:       32 * 1024, // 32KB
+		rateLimitBurst:       10,
+		drainTimeout:         5 * time.Second,
+		messageHandleTimeout: 30 * time.Second,
+		logger:               defaultLogger(),
 	}
 }
 
@@ -138,6 +145,9 @@ func (o *serverOptions) validate() {
 	}
 	if o.drainTimeout <= 0 {
 		o.drainTimeout = 5 * time.Second
+	}
+	if o.messageHandleTimeout < 0 {
+		o.messageHandleTimeout = 0
 	}
 	if o.logger == nil {
 		o.logger = defaultLogger()
@@ -236,6 +246,18 @@ func WithClusterRelay(r ClusterRelay) ServerOption {
 // WithDrainTimeout sets the maximum time to drain pending messages on disconnect (default 5s).
 func WithDrainTimeout(d time.Duration) ServerOption {
 	return func(o *serverOptions) { o.drainTimeout = d }
+}
+
+// WithMessageHandleTimeout sets the per-message handle timeout applied to the
+// ctx passed into OnMessage (default 30s). Pass 0 to disable (OnMessage will
+// receive the connection ctx unchanged).
+//
+// This is a soft hint: readPump dispatches OnMessage synchronously, so a
+// handler that ignores ctx cancellation will still block readPump regardless.
+// It is most useful when the handler propagates ctx into downstream IO (DB,
+// RPC, etc.) so those operations can abort early.
+func WithMessageHandleTimeout(d time.Duration) ServerOption {
+	return func(o *serverOptions) { o.messageHandleTimeout = d }
 }
 
 // WithLogger sets a structured logger for the Server and Hub.

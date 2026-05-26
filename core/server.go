@@ -3,12 +3,18 @@ package core
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"time"
 
 	"github.com/coder/websocket"
 	"github.com/google/uuid"
 	"golang.org/x/time/rate"
+)
+
+const (
+	DatadogSpanId  = "X-Datadog-Span-Id"
+	DatadogTraceId = "X-Datadog-Trace-Id"
 )
 
 // NewServer creates a Server with the given EventHandler and options.
@@ -288,6 +294,7 @@ func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, connID string, 
 	// This prevents framework-specific request context cancellation from killing
 	// long-lived WebSocket connections. The context is cancelled when readPump exits.
 	connCtx, connCancel := context.WithCancel(context.Background())
+	connCtx = context.WithValue(context.WithValue(connCtx, DatadogTraceId, rand.Uint64()&0x7FFFFFFFFFFFFFFF), DatadogSpanId, rand.Uint64()&0x7FFFFFFFFFFFFFFF)
 	s.wg.Add(2)
 	go s.writePump(connCtx, conn)
 	s.readPump(connCtx, connCancel, conn) // blocks
@@ -344,9 +351,23 @@ func (s *Server) readPump(ctx context.Context, connCancel context.CancelFunc, c 
 		msg := &Message{Raw: data}
 		msg.Type = s.parser.ParseType(data)
 
-		if err := s.onMessage(ctx, c, msg); err != nil {
+		// Derive a per-message ctx with the configured handle timeout so
+		// downstream IO inside OnMessage can abort early. This is a soft
+		// hint — readPump is synchronous, so a handler that ignores ctx
+		// will still block the read loop.
+		msgCtx := ctx
+		var cancel context.CancelFunc
+		if s.opts.messageHandleTimeout > 0 {
+			msgCtx, cancel = context.WithTimeout(ctx, s.opts.messageHandleTimeout)
+		}
+		if err := s.onMessage(msgCtx, c, msg); err != nil {
+			// Intentionally pass the outer ctx (not msgCtx) to onError so the
+			// error handler isn't already cancelled when OnMessage timed out.
 			s.onError(ctx, c, err)
 			s.metrics.IncErrors()
+		}
+		if cancel != nil {
+			cancel()
 		}
 	}
 }
