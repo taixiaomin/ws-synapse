@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -465,7 +466,7 @@ func (r *RedisClusterRelay) consumeLoop() {
 		cancel()
 
 		if err != nil {
-			if err == redis.Nil {
+			if errors.Is(err, redis.Nil) {
 				continue // No messages, normal.
 			}
 			// Check if we're shutting down.
@@ -474,6 +475,20 @@ func (r *RedisClusterRelay) consumeLoop() {
 				return
 			default:
 			}
+
+			// Stream key expired (TTL) or was deleted — recreate it with a
+			// fresh consumer group so consumption can resume.
+			if isNoGroupErr(err) {
+				r.logger.Info("consume: stream expired, recreating consumer group", "stream", streamKey)
+				recreateErr := r.client.XGroupCreateMkStream(
+					context.Background(), streamKey, defaultGroupName, "0",
+				).Err()
+				if recreateErr != nil && !isGroupExistsErr(recreateErr) {
+					r.logger.Warn("consume: recreate group failed", "error", recreateErr)
+				}
+				continue
+			}
+
 			r.logger.Warn("consume: xreadgroup error", "error", err)
 			time.Sleep(time.Second) // Backoff on error.
 			continue
@@ -627,6 +642,12 @@ func jitterTTL(d time.Duration) time.Duration {
 
 func isGroupExistsErr(err error) bool {
 	return err != nil && err.Error() == "BUSYGROUP Consumer Group name already exists"
+}
+
+// isNoGroupErr detects "NOGROUP" Redis errors — the stream key or its
+// consumer group no longer exists (typically because the key expired via TTL).
+func isNoGroupErr(err error) bool {
+	return redis.HasErrorPrefix(err, "NOGROUP")
 }
 
 // nopLogger is a no-op logger used when none is configured.
