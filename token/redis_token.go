@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"fmt"
+	"math/rand"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -12,7 +13,7 @@ import (
 
 const (
 	defaultRedisKeyPrefix = "ws:token:"
-	defaultRedisTTL       = 24 * time.Hour
+	defaultRedisTTL       = 3 * time.Hour
 )
 
 // RedisOption configures a RedisTokenProvider.
@@ -53,7 +54,7 @@ func NewRedisTokenProvider(client redis.Cmdable, opts ...RedisOption) *RedisToke
 func (p *RedisTokenProvider) Generate(ctx context.Context, connID string) (string, error) {
 	tok := GenerateRandomToken()
 	key := p.key(connID)
-	if err := p.client.Set(ctx, key, tok, p.ttl).Err(); err != nil {
+	if err := p.client.Set(ctx, key, tok, jitterTTL(p.ttl)).Err(); err != nil {
 		return "", fmt.Errorf("redis token generate: %w", err)
 	}
 	return tok, nil
@@ -84,6 +85,15 @@ func (p *RedisTokenProvider) Revoke(ctx context.Context, connID string) error {
 
 func (p *RedisTokenProvider) key(connID string) string {
 	return p.keyPrefix + connID
+}
+
+// jitterTTL returns d with ±10% random jitter to prevent cache stampede.
+func jitterTTL(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	jitter := time.Duration(rand.Int63n(int64(d) / 5))
+	return d - d/10 + jitter
 }
 
 var _ core.TokenProvider = (*RedisTokenProvider)(nil)

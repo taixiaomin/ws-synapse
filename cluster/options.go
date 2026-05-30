@@ -15,6 +15,8 @@ const (
 	defaultBlockDuration     = 5 * time.Second
 	defaultTopicSharedTTL    = 5 * time.Second
 	defaultGroupName         = "relay"
+	defaultTopicTTL          = 3 * time.Hour
+	defaultStreamTTL         = 5 * time.Minute
 )
 
 // Option configures a RedisClusterRelay.
@@ -56,6 +58,20 @@ func WithKeyPrefix(prefix string) Option {
 // local-only/shared topic decision before refreshing via SMembers.
 func WithTopicSharedTTL(d time.Duration) Option {
 	return func(r *RedisClusterRelay) { r.topicSharedTTL = d }
+}
+
+// WithTopicTTL sets the TTL for topic membership SET keys (default 3h).
+// Topic keys are refreshed every heartbeat interval; the TTL acts as a
+// safety net so orphan keys are cleaned up after node crashes.
+func WithTopicTTL(d time.Duration) Option {
+	return func(r *RedisClusterRelay) { r.topicTTL = d }
+}
+
+// WithStreamTTL sets the TTL for per-node stream keys (default 5min).
+// Stream keys are refreshed every heartbeat interval; the TTL ensures
+// orphan streams from crashed nodes are automatically reclaimed.
+func WithStreamTTL(d time.Duration) Option {
+	return func(r *RedisClusterRelay) { r.streamTTL = d }
 }
 
 // WithLogger sets the logger for the relay. Compatible with core.Logger.
