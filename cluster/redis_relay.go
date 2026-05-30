@@ -125,6 +125,11 @@ func (r *RedisClusterRelay) Start(handler core.RelayHandler) error {
 	if err != nil && !isGroupExistsErr(err) {
 		return fmt.Errorf("cluster relay create group: %w", err)
 	}
+	// Set initial TTL so the stream auto-expires if this node crashes
+	// before the first heartbeat tick.
+	if r.streamTTL > 0 {
+		_ = r.client.Expire(ctx, streamKey, r.streamTTL).Err()
+	}
 
 	r.wg.Add(2)
 	go r.heartbeatLoop()
@@ -480,11 +485,17 @@ func (r *RedisClusterRelay) consumeLoop() {
 			// fresh consumer group so consumption can resume.
 			if isNoGroupErr(err) {
 				r.logger.Info("consume: stream expired, recreating consumer group", "stream", streamKey)
+				recreateCtx := context.Background()
 				recreateErr := r.client.XGroupCreateMkStream(
-					context.Background(), streamKey, defaultGroupName, "0",
+					recreateCtx, streamKey, defaultGroupName, "0",
 				).Err()
 				if recreateErr != nil && !isGroupExistsErr(recreateErr) {
 					r.logger.Warn("consume: recreate group failed", "error", recreateErr)
+				}
+				// Set TTL immediately so the stream auto-expires if this node
+				// crashes before the next heartbeat tick.
+				if r.streamTTL > 0 {
+					_ = r.client.Expire(recreateCtx, streamKey, r.streamTTL).Err()
 				}
 				continue
 			}
