@@ -22,3 +22,4 @@
 
 # Documentation (local only, not published)
 docs/
+.DS_Store
