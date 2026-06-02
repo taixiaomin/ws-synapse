@@ -78,8 +78,12 @@ var (
 	WithHubTokenProvider      = core.WithHubTokenProvider
 	WithHubDrainTimeout       = core.WithHubDrainTimeout
 	WithHubClusterRelay       = core.WithHubClusterRelay
-	WithBroadcastShardSize    = core.WithBroadcastShardSize
+	WithBroadcastShardSize = core.WithBroadcastShardSize
 )
+
+// ── Server-level broadcast shard option (forwarded to Hub internally) ──
+
+var WithBroadcastShardSizeOpt = core.WithBroadcastShardSizeOpt
 
 // ── Server Options ──
 var (

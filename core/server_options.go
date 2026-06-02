@@ -100,6 +100,12 @@ type serverOptions struct {
 	// handler that ignores ctx.Done() will still block readPump regardless.
 	messageHandleTimeout time.Duration
 
+	// broadcastShardSize is the number of connections per parallel shard during
+	// broadcast. When the subscriber list exceeds this size, broadcastDirect
+	// splits it into shards and enqueues messages in parallel goroutines.
+	// 0 = sequential (default). Recommended: 1000 for 10K+ connections.
+	broadcastShardSize int
+
 	// logger, default slog-based logger
 	logger Logger
 
@@ -236,6 +242,14 @@ func WithTokenProvider(tp TokenProvider) ServerOption {
 // WithMessageParser sets a custom MessageParser for extracting message types from inbound data.
 func WithMessageParser(p MessageParser) ServerOption {
 	return func(o *serverOptions) { o.messageParser = p }
+}
+
+// WithBroadcastShardSizeOpt sets the broadcast shard size at the Server level.
+// This is forwarded to the underlying Hub. When the subscriber list exceeds
+// this size, broadcastDirect splits into parallel goroutines for enqueue.
+// 0 = sequential (default). Recommended: 1000 for 10K+ connections.
+func WithBroadcastShardSizeOpt(size int) ServerOption {
+	return func(o *serverOptions) { o.broadcastShardSize = size }
 }
 
 // WithClusterRelay enables distributed mode with cross-node message routing.

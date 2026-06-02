@@ -48,6 +48,9 @@ func NewServer(handler EventHandler, opts ...ServerOption) *Server {
 	if o.clusterRelay != nil {
 		hubOpts = append(hubOpts, WithHubClusterRelay(o.clusterRelay))
 	}
+	if o.broadcastShardSize > 0 {
+		hubOpts = append(hubOpts, WithBroadcastShardSize(o.broadcastShardSize))
+	}
 
 	hub := NewHub(hubOpts...)
 
