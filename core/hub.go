@@ -122,13 +122,14 @@ type Hub struct {
 	topicsMu sync.RWMutex
 	topics   map[string]*topicSubs
 
-	pendingStore  PendingStore
-	logger        Logger
-	metrics       MetricsCollector
-	topicHandler  TopicEventHandler // optional; may be nil
-	tokenProvider TokenProvider     // optional; used by Shutdown to revoke tokens
-	relay         ClusterRelay      // optional; nil = single-node mode
-	drainTimeout  time.Duration     // max time to wait for old conn drain on replace
+	pendingStore       PendingStore
+	logger             Logger
+	metrics            MetricsCollector
+	topicHandler       TopicEventHandler // optional; may be nil
+	tokenProvider      TokenProvider     // optional; used by Shutdown to revoke tokens
+	relay              ClusterRelay      // optional; nil = single-node mode
+	drainTimeout       time.Duration     // max time to wait for old conn drain on replace
+	broadcastShardSize int               // connections per parallel shard; 0 = sequential (default)
 }
 
 // HubOption configures a Hub created via NewHub.
@@ -157,6 +158,15 @@ func WithHubPendingStore(s PendingStore) HubOption {
 // WithHubTopicHandler sets the TopicEventHandler for lifecycle callbacks.
 func WithHubTopicHandler(th TopicEventHandler) HubOption {
 	return func(h *Hub) { h.topicHandler = th }
+}
+
+// WithBroadcastShardSize sets the number of connections per parallel shard
+// during broadcast. When the subscriber list exceeds this size, broadcastDirect
+// splits the list into shards and enqueues messages via parallel goroutines.
+// 0 or negative disables sharding (sequential broadcast, the default).
+// Recommended value: 1000-2000 for deployments with 10K+ connections.
+func WithBroadcastShardSize(size int) HubOption {
+	return func(h *Hub) { h.broadcastShardSize = size }
 }
 
 // WithHubTokenProvider sets the TokenProvider so Shutdown can revoke tokens.
@@ -461,7 +471,37 @@ func (h *Hub) broadcastDirect(ctx context.Context, topic string, data []byte, ex
 	copy(cp, data)
 	env := MessageEnvelope{Data: cp, MsgType: websocket.MessageText}
 
-	for _, c := range list {
+	// When broadcastShardSize is configured and the subscriber list is large
+	// enough, split into shards and enqueue in parallel. Each shard runs in
+	// its own goroutine; enqueueShared is fully non-blocking and thread-safe
+	// (double select + default), so parallel access is safe. PendingStore
+	// operations within each shard are also independent (keyed by connID).
+	if h.broadcastShardSize > 0 && len(list) > h.broadcastShardSize {
+		var wg sync.WaitGroup
+		for i := 0; i < len(list); i += h.broadcastShardSize {
+			end := i + h.broadcastShardSize
+			if end > len(list) {
+				end = len(list)
+			}
+			shard := list[i:end]
+			wg.Add(1)
+			go func(conns []*Conn) {
+				defer wg.Done()
+				h.broadcastShard(ctx, topic, conns, env, cp, excludeSet)
+			}(shard)
+		}
+		wg.Wait()
+		return
+	}
+
+	// Small list or sharding disabled — sequential path (no goroutine overhead).
+	h.broadcastShard(ctx, topic, list, env, cp, excludeSet)
+}
+
+// broadcastShard enqueues a message to a subset of connections. Extracted from
+// broadcastDirect to support both sequential and parallel broadcast paths.
+func (h *Hub) broadcastShard(ctx context.Context, topic string, conns []*Conn, env MessageEnvelope, rawData []byte, excludeSet map[string]struct{}) {
+	for _, c := range conns {
 		if excludeSet != nil {
 			if _, excluded := excludeSet[c.id]; excluded {
 				continue
@@ -473,7 +513,7 @@ func (h *Hub) broadcastDirect(ctx context.Context, topic string, data []byte, ex
 		// sendCh full or conn already closed — buffer to PendingStore so the
 		// message survives across reconnects.
 		if h.pendingStore != nil {
-			pm := PendingMessage{Data: cp, MsgType: MsgTypeText}
+			pm := PendingMessage{Data: rawData, MsgType: MsgTypeText}
 			if err := h.pendingStore.PushEnvelope(ctx, c.id, pm); err != nil {
 				h.logger.Warn("broadcast: overflow push failed", "topic", topic, "connID", c.id, "error", err)
 				h.metrics.IncDrops()

@@ -70,14 +70,15 @@ var (
 
 // ── Hub Options ──
 var (
-	WithHubLogger        = core.WithHubLogger
-	WithHubMaxConns      = core.WithHubMaxConns
-	WithHubMetrics       = core.WithHubMetrics
-	WithHubPendingStore  = core.WithHubPendingStore
-	WithHubTopicHandler  = core.WithHubTopicHandler
-	WithHubTokenProvider = core.WithHubTokenProvider
-	WithHubDrainTimeout  = core.WithHubDrainTimeout
-	WithHubClusterRelay  = core.WithHubClusterRelay
+	WithHubLogger             = core.WithHubLogger
+	WithHubMaxConns           = core.WithHubMaxConns
+	WithHubMetrics            = core.WithHubMetrics
+	WithHubPendingStore       = core.WithHubPendingStore
+	WithHubTopicHandler       = core.WithHubTopicHandler
+	WithHubTokenProvider      = core.WithHubTokenProvider
+	WithHubDrainTimeout       = core.WithHubDrainTimeout
+	WithHubClusterRelay       = core.WithHubClusterRelay
+	WithBroadcastShardSize    = core.WithBroadcastShardSize
 )
 
 // ── Server Options ──

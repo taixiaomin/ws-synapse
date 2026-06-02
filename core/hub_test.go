@@ -720,6 +720,219 @@ func TestHub_Concurrent_BroadcastSubscribeDisconnect(t *testing.T) {
 	}
 }
 
+// ── Broadcast Shard Tests ────────────────────────────────────────────────────
+
+func TestBroadcastShardSize_ZeroDisablesSharding(t *testing.T) {
+	// broadcastShardSize=0 (default) — sequential path, all conns receive message.
+	h := NewHub(WithHubLogger(NopLogger{}))
+	ctx := context.Background()
+	conns := make([]*Conn, 10)
+	for i := range conns {
+		c := testConn("u" + string(rune('A'+i)))
+		c.hub = h
+		_ = h.register(ctx, c)
+		h.Subscribe(ctx, c, "room")
+		conns[i] = c
+	}
+
+	h.Broadcast(ctx, "room", []byte("hello"))
+
+	for _, c := range conns {
+		select {
+		case env := <-c.sendCh:
+			if string(env.Data) != "hello" {
+				t.Fatalf("expected hello, got %s", env.Data)
+			}
+		default:
+			t.Fatalf("no message for %s", c.id)
+		}
+	}
+}
+
+func TestBroadcastShardSize_SmallListNoSharding(t *testing.T) {
+	// shardSize=1000 but only 50 conns — should NOT shard (list < shardSize).
+	h := NewHub(WithHubLogger(NopLogger{}), WithBroadcastShardSize(1000))
+	ctx := context.Background()
+	conns := make([]*Conn, 50)
+	for i := range conns {
+		c := testConn("u" + string(rune('A'+i%26)) + string(rune('0'+i/26)))
+		c.hub = h
+		_ = h.register(ctx, c)
+		h.Subscribe(ctx, c, "room")
+		conns[i] = c
+	}
+
+	h.Broadcast(ctx, "room", []byte("small"))
+
+	for _, c := range conns {
+		select {
+		case env := <-c.sendCh:
+			if string(env.Data) != "small" {
+				t.Fatalf("expected small, got %s", env.Data)
+			}
+		default:
+			t.Fatalf("no message for %s", c.id)
+		}
+	}
+}
+
+func TestBroadcastShardSize_LargeListParallel(t *testing.T) {
+	// shardSize=100, 3000 conns → 30 shards in parallel.
+	const numConns = 3000
+	h := NewHub(WithHubLogger(NopLogger{}), WithBroadcastShardSize(100))
+	ctx := context.Background()
+	conns := make([]*Conn, numConns)
+	for i := range conns {
+		id := "u" + string(rune('A'+i%26)) + string(rune('0'+(i/26)%10)) + string(rune('a'+(i/260)%26))
+		c := testConn(id)
+		c.hub = h
+		_ = h.register(ctx, c)
+		h.Subscribe(ctx, c, "room")
+		conns[i] = c
+	}
+
+	h.Broadcast(ctx, "room", []byte("parallel"))
+
+	received := 0
+	for _, c := range conns {
+		select {
+		case env := <-c.sendCh:
+			if string(env.Data) != "parallel" {
+				t.Fatalf("expected parallel, got %s", env.Data)
+			}
+			received++
+		default:
+			t.Fatalf("no message for %s", c.id)
+		}
+	}
+	if received != numConns {
+		t.Fatalf("expected %d messages, got %d", numConns, received)
+	}
+}
+
+func TestBroadcastShardSize_WithExcludeSet(t *testing.T) {
+	const numConns = 500
+	h := NewHub(WithHubLogger(NopLogger{}), WithBroadcastShardSize(100))
+	ctx := context.Background()
+	conns := make([]*Conn, numConns)
+	for i := range conns {
+		id := "u" + string(rune('A'+i%26)) + string(rune('0'+(i/26)%10)) + string(rune('a'+(i/260)%26))
+		c := testConn(id)
+		c.hub = h
+		_ = h.register(ctx, c)
+		h.Subscribe(ctx, c, "room")
+		conns[i] = c
+	}
+
+	// Exclude first 100 connections.
+	excludeIDs := make([]string, 100)
+	for i := 0; i < 100; i++ {
+		excludeIDs[i] = conns[i].id
+	}
+	h.BroadcastExclude(ctx, "room", []byte("filtered"), excludeIDs...)
+
+	// Excluded conns should NOT receive.
+	for i := 0; i < 100; i++ {
+		select {
+		case <-conns[i].sendCh:
+			t.Fatalf("excluded conn %s should not receive", conns[i].id)
+		default:
+			// OK
+		}
+	}
+	// Remaining conns should receive.
+	for i := 100; i < numConns; i++ {
+		select {
+		case env := <-conns[i].sendCh:
+			if string(env.Data) != "filtered" {
+				t.Fatalf("wrong data for %s", conns[i].id)
+			}
+		default:
+			t.Fatalf("no message for %s", conns[i].id)
+		}
+	}
+}
+
+func TestBroadcastShardSize_WithOverflow(t *testing.T) {
+	ps := newMemPendingStore()
+	h := NewHub(WithHubLogger(NopLogger{}), WithHubPendingStore(ps), WithBroadcastShardSize(50))
+	ctx := context.Background()
+
+	const numConns = 200
+	conns := make([]*Conn, numConns)
+	for i := range conns {
+		id := "u" + string(rune('A'+i%26)) + string(rune('0'+(i/26)%10))
+		// sendCh buffer=1 to force overflow on second broadcast.
+		c := &Conn{
+			id:          id,
+			sendCh:      make(chan MessageEnvelope, 1),
+			done:        make(chan struct{}),
+			drained:     make(chan struct{}),
+			overflowSig: make(chan struct{}, 1),
+		}
+		c.hub = h
+		_ = h.register(ctx, c)
+		h.Subscribe(ctx, c, "room")
+		conns[i] = c
+	}
+
+	// First broadcast fills sendCh (buffer=1).
+	h.Broadcast(ctx, "room", []byte("first"))
+	// Second broadcast — all sendCh full, should overflow to PendingStore.
+	h.Broadcast(ctx, "room", []byte("second"))
+
+	overflowed := 0
+	for _, c := range conns {
+		if ps.count(c.id) > 0 {
+			overflowed++
+		}
+	}
+	if overflowed != numConns {
+		t.Fatalf("expected %d overflowed, got %d", numConns, overflowed)
+	}
+}
+
+func TestBroadcastShardSize_ClosedConn(t *testing.T) {
+	h := NewHub(WithHubLogger(NopLogger{}), WithBroadcastShardSize(50))
+	ctx := context.Background()
+
+	const numConns = 200
+	conns := make([]*Conn, numConns)
+	for i := range conns {
+		id := "u" + string(rune('A'+i%26)) + string(rune('0'+(i/26)%10))
+		c := testConn(id)
+		c.hub = h
+		_ = h.register(ctx, c)
+		h.Subscribe(ctx, c, "room")
+		conns[i] = c
+	}
+
+	// Close half the connections.
+	for i := 0; i < numConns/2; i++ {
+		conns[i].Finish()
+	}
+
+	// Should not panic.
+	h.Broadcast(ctx, "room", []byte("mixed"))
+
+	// Open conns should receive.
+	received := 0
+	for i := numConns / 2; i < numConns; i++ {
+		select {
+		case env := <-conns[i].sendCh:
+			if string(env.Data) != "mixed" {
+				t.Fatalf("wrong data")
+			}
+			received++
+		default:
+			t.Fatalf("no message for open conn %s", conns[i].id)
+		}
+	}
+	if received != numConns/2 {
+		t.Fatalf("expected %d received, got %d", numConns/2, received)
+	}
+}
+
 // ── Benchmarks ───────────────────────────────────────────────────────────────
 
 func BenchmarkHub_Send(b *testing.B) {
@@ -745,23 +958,49 @@ func BenchmarkHub_Send(b *testing.B) {
 }
 
 func BenchmarkHub_Broadcast_10(b *testing.B) {
-	benchmarkBroadcast(b, 10)
+	benchmarkBroadcast(b, 10, 0)
 }
 
 func BenchmarkHub_Broadcast_100(b *testing.B) {
-	benchmarkBroadcast(b, 100)
+	benchmarkBroadcast(b, 100, 0)
 }
 
 func BenchmarkHub_Broadcast_1000(b *testing.B) {
-	benchmarkBroadcast(b, 1000)
+	benchmarkBroadcast(b, 1000, 0)
 }
 
-func benchmarkBroadcast(b *testing.B, n int) {
-	h := NewHub(WithHubLogger(NopLogger{}))
+func BenchmarkHub_Broadcast_1000_Sharded(b *testing.B) {
+	benchmarkBroadcast(b, 1000, 200)
+}
+
+func BenchmarkHub_Broadcast_5000(b *testing.B) {
+	benchmarkBroadcast(b, 5000, 0)
+}
+
+func BenchmarkHub_Broadcast_5000_Sharded(b *testing.B) {
+	benchmarkBroadcast(b, 5000, 1000)
+}
+
+func BenchmarkHub_Broadcast_10000(b *testing.B) {
+	benchmarkBroadcast(b, 10000, 0)
+}
+
+func BenchmarkHub_Broadcast_10000_Sharded(b *testing.B) {
+	benchmarkBroadcast(b, 10000, 1000)
+}
+
+func benchmarkBroadcast(b *testing.B, n int, shardSize int) {
+	opts := []HubOption{WithHubLogger(NopLogger{})}
+	if shardSize > 0 {
+		opts = append(opts, WithBroadcastShardSize(shardSize))
+	}
+	h := NewHub(opts...)
 	ctx := context.Background()
 
 	for i := 0; i < n; i++ {
-		c := testConn(string(rune('A'+i%26)) + string(rune('0'+i/26)))
+		// Use fmt.Sprintf for unique IDs even at 10K+ scale.
+		id := "b" + string(rune('A'+i%26)) + string(rune('0'+(i/26)%10)) + string(rune('a'+(i/260)%26)) + string(rune('A'+(i/6760)%26))
+		c := testConn(id)
 		c.hub = h
 		_ = h.register(ctx, c)
 		h.Subscribe(ctx, c, "room")
