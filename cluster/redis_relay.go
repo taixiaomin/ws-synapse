@@ -25,19 +25,19 @@ type RedisClusterRelay struct {
 	client redis.Cmdable
 	nodeID string
 
-	handler           core.RelayHandler
-	pendingStore      core.PendingStore
-	logger            core.Logger
-	keyPrefix         string
-	streamMaxLen      int64
-	connTTL           time.Duration
-	nodeTTL           time.Duration
-	heartbeatInterval time.Duration
-	blockDuration     time.Duration
-	topicSharedTTL    time.Duration
+	handler                core.RelayHandler
+	pendingStore           core.PendingStore
+	logger                 core.Logger
+	keyPrefix              string
+	streamMaxLen           int64
+	connTTL                time.Duration
+	nodeTTL                time.Duration
+	heartbeatInterval      time.Duration
+	blockDuration          time.Duration
+	topicSharedTTL         time.Duration
 	staleNodeSweepInterval time.Duration
-	topicTTL          time.Duration
-	streamTTL         time.Duration
+	topicTTL               time.Duration
+	streamTTL              time.Duration
 
 	// localConns tracks connIDs registered on this node for TTL renewal.
 	localConns sync.Map // connID → struct{}
@@ -83,20 +83,20 @@ type topicSharedCacheEntry struct {
 // when the target node for a Send is unreachable.
 func NewRedisClusterRelay(client redis.Cmdable, pendingStore core.PendingStore, opts ...Option) *RedisClusterRelay {
 	r := &RedisClusterRelay{
-		client:            client,
-		nodeID:            uuid.New().String(),
-		pendingStore:      pendingStore,
-		keyPrefix:         defaultKeyPrefix,
-		streamMaxLen:      defaultStreamMaxLen,
-		connTTL:           defaultConnTTL,
-		nodeTTL:           defaultNodeTTL,
-		heartbeatInterval: defaultHeartbeatInterval,
-		blockDuration:     defaultBlockDuration,
-		topicSharedTTL:    defaultTopicSharedTTL,
+		client:                 client,
+		nodeID:                 uuid.New().String(),
+		pendingStore:           pendingStore,
+		keyPrefix:              defaultKeyPrefix,
+		streamMaxLen:           defaultStreamMaxLen,
+		connTTL:                defaultConnTTL,
+		nodeTTL:                defaultNodeTTL,
+		heartbeatInterval:      defaultHeartbeatInterval,
+		blockDuration:          defaultBlockDuration,
+		topicSharedTTL:         defaultTopicSharedTTL,
 		staleNodeSweepInterval: defaultStaleNodeSweepInterval,
-		topicTTL:          defaultTopicTTL,
-		streamTTL:         defaultStreamTTL,
-		stopCh:            make(chan struct{}),
+		topicTTL:               defaultTopicTTL,
+		streamTTL:              defaultStreamTTL,
+		stopCh:                 make(chan struct{}),
 	}
 	for _, fn := range opts {
 		fn(r)
