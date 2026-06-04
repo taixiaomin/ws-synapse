@@ -7,14 +7,15 @@ import (
 )
 
 const (
-	defaultHeartbeatInterval = 30 * time.Second
-	defaultConnTTL           = 120 * time.Second
-	defaultNodeTTL           = 60 * time.Second
-	defaultStreamMaxLen      = 1000
-	defaultKeyPrefix         = "ws:"
-	defaultBlockDuration     = 5 * time.Second
-	defaultTopicSharedTTL    = 5 * time.Second
-	defaultGroupName         = "relay"
+	defaultHeartbeatInterval      = 30 * time.Second
+	defaultConnTTL                = 120 * time.Second
+	defaultNodeTTL                = 60 * time.Second
+	defaultStreamMaxLen           = 1000
+	defaultKeyPrefix              = "ws:"
+	defaultBlockDuration          = 5 * time.Second
+	defaultTopicSharedTTL         = 5 * time.Second
+	defaultStaleNodeSweepInterval = 5 * time.Minute
+	defaultGroupName              = "relay"
 )
 
 // Option configures a RedisClusterRelay.
@@ -56,6 +57,16 @@ func WithKeyPrefix(prefix string) Option {
 // local-only/shared topic decision before refreshing via SMembers.
 func WithTopicSharedTTL(d time.Duration) Option {
 	return func(r *RedisClusterRelay) { r.topicSharedTTL = d }
+}
+
+// WithStaleNodeSweepInterval sets how often the relay scans all topic sets
+// to remove nodeIDs whose nodeAlive key has expired (default 5min). A node
+// that crashes without running Stop() leaves orphan nodeIDs in topic sets;
+// PublishBroadcast lazy-cleans them only for topics it broadcasts to, so a
+// background sweep is needed for topics that are no longer broadcast.
+// Pass 0 or a negative duration to disable the sweep entirely.
+func WithStaleNodeSweepInterval(d time.Duration) Option {
+	return func(r *RedisClusterRelay) { r.staleNodeSweepInterval = d }
 }
 
 // WithLogger sets the logger for the relay. Compatible with core.Logger.
