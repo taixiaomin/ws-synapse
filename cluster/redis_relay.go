@@ -9,7 +9,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -23,17 +25,19 @@ type RedisClusterRelay struct {
 	client redis.Cmdable
 	nodeID string
 
-	handler                core.RelayHandler
-	pendingStore           core.PendingStore
-	logger                 core.Logger
-	keyPrefix              string
-	streamMaxLen           int64
-	connTTL                time.Duration
-	nodeTTL                time.Duration
-	heartbeatInterval      time.Duration
-	blockDuration          time.Duration
-	topicSharedTTL         time.Duration
+	handler           core.RelayHandler
+	pendingStore      core.PendingStore
+	logger            core.Logger
+	keyPrefix         string
+	streamMaxLen      int64
+	connTTL           time.Duration
+	nodeTTL           time.Duration
+	heartbeatInterval time.Duration
+	blockDuration     time.Duration
+	topicSharedTTL    time.Duration
 	staleNodeSweepInterval time.Duration
+	topicTTL          time.Duration
+	streamTTL         time.Duration
 
 	// localConns tracks connIDs registered on this node for TTL renewal.
 	localConns sync.Map // connID → struct{}
@@ -79,18 +83,20 @@ type topicSharedCacheEntry struct {
 // when the target node for a Send is unreachable.
 func NewRedisClusterRelay(client redis.Cmdable, pendingStore core.PendingStore, opts ...Option) *RedisClusterRelay {
 	r := &RedisClusterRelay{
-		client:                 client,
-		nodeID:                 uuid.New().String(),
-		pendingStore:           pendingStore,
-		keyPrefix:              defaultKeyPrefix,
-		streamMaxLen:           defaultStreamMaxLen,
-		connTTL:                defaultConnTTL,
-		nodeTTL:                defaultNodeTTL,
-		heartbeatInterval:      defaultHeartbeatInterval,
-		blockDuration:          defaultBlockDuration,
-		topicSharedTTL:         defaultTopicSharedTTL,
+		client:            client,
+		nodeID:            uuid.New().String(),
+		pendingStore:      pendingStore,
+		keyPrefix:         defaultKeyPrefix,
+		streamMaxLen:      defaultStreamMaxLen,
+		connTTL:           defaultConnTTL,
+		nodeTTL:           defaultNodeTTL,
+		heartbeatInterval: defaultHeartbeatInterval,
+		blockDuration:     defaultBlockDuration,
+		topicSharedTTL:    defaultTopicSharedTTL,
 		staleNodeSweepInterval: defaultStaleNodeSweepInterval,
-		stopCh:                 make(chan struct{}),
+		topicTTL:          defaultTopicTTL,
+		streamTTL:         defaultStreamTTL,
+		stopCh:            make(chan struct{}),
 	}
 	for _, fn := range opts {
 		fn(r)
@@ -120,6 +126,11 @@ func (r *RedisClusterRelay) Start(handler core.RelayHandler) error {
 	err := r.client.XGroupCreateMkStream(ctx, streamKey, defaultGroupName, "0").Err()
 	if err != nil && !isGroupExistsErr(err) {
 		return fmt.Errorf("cluster relay create group: %w", err)
+	}
+	// Set initial TTL so the stream auto-expires if this node crashes
+	// before the first heartbeat tick.
+	if r.streamTTL > 0 {
+		_ = r.client.Expire(ctx, streamKey, r.streamTTL).Err()
 	}
 
 	r.wg.Add(2)
@@ -216,6 +227,10 @@ func (r *RedisClusterRelay) OnSubscribe(ctx context.Context, _, topic string) er
 		// First subscriber on this node — add node to topic set.
 		if err := r.client.SAdd(ctx, r.topicKey(topic), r.nodeID).Err(); err != nil {
 			return err
+		}
+		// Set/refresh TTL so orphan topic keys auto-expire after node crashes.
+		if r.topicTTL > 0 {
+			_ = r.client.Expire(ctx, r.topicKey(topic), jitterTTL(r.topicTTL)).Err()
 		}
 		// Tell other nodes their topicShared cache for this topic is stale —
 		// we just joined as a (possibly new) remote node from their POV.
@@ -410,6 +425,11 @@ func (r *RedisClusterRelay) heartbeatLoop() {
 			// if it was deleted by another node that mistakenly thought we were dead.
 			_ = r.client.Set(ctx, r.nodeAliveKey(), "1", r.nodeTTL).Err()
 
+			// Refresh stream TTL so orphan streams auto-expire after node crashes.
+			if r.streamTTL > 0 {
+				_ = r.client.Expire(ctx, r.streamKey(r.nodeID), r.streamTTL).Err()
+			}
+
 			// Refresh connection registrations in a pipeline — use Set (not Expire)
 			// to recreate keys that may have been cleaned up by other nodes during
 			// a transient Redis outage longer than connTTL.
@@ -439,6 +459,16 @@ func (r *RedisClusterRelay) heartbeatLoop() {
 				pipe.SAdd(ctx, r.topicKey(topic), r.nodeID)
 				return true
 			})
+
+			// Refresh topic TTL so orphan topic keys auto-expire after node crashes.
+			if r.topicTTL > 0 {
+				r.localTopics.Range(func(key, _ any) bool {
+					topic := key.(string)
+					pipe.Expire(ctx, r.topicKey(topic), jitterTTL(r.topicTTL))
+					return true
+				})
+			}
+
 			_, _ = pipe.Exec(ctx)
 
 			// Drop expired topicShared cache entries so the map doesn't grow
@@ -487,7 +517,7 @@ func (r *RedisClusterRelay) consumeLoop() {
 		cancel()
 
 		if err != nil {
-			if err == redis.Nil {
+			if errors.Is(err, redis.Nil) {
 				continue // No messages, normal.
 			}
 			// Check if we're shutting down.
@@ -496,6 +526,26 @@ func (r *RedisClusterRelay) consumeLoop() {
 				return
 			default:
 			}
+
+			// Stream key expired (TTL) or was deleted — recreate it with a
+			// fresh consumer group so consumption can resume.
+			if isNoGroupErr(err) {
+				r.logger.Info("consume: stream expired, recreating consumer group", "stream", streamKey)
+				recreateCtx := context.Background()
+				recreateErr := r.client.XGroupCreateMkStream(
+					recreateCtx, streamKey, defaultGroupName, "0",
+				).Err()
+				if recreateErr != nil && !isGroupExistsErr(recreateErr) {
+					r.logger.Warn("consume: recreate group failed", "error", recreateErr)
+				}
+				// Set TTL immediately so the stream auto-expires if this node
+				// crashes before the next heartbeat tick.
+				if r.streamTTL > 0 {
+					_ = r.client.Expire(recreateCtx, streamKey, r.streamTTL).Err()
+				}
+				continue
+			}
+
 			r.logger.Warn("consume: xreadgroup error", "error", err)
 			time.Sleep(time.Second) // Backoff on error.
 			continue
@@ -723,8 +773,24 @@ func (r *RedisClusterRelay) membershipChangeLoop() {
 	}
 }
 
+// jitterTTL returns d with ±10% random jitter to prevent cache stampede.
+func jitterTTL(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	// rand.Int63n produces [0, 20% of d), then shift to [-10%, +10%).
+	jitter := time.Duration(rand.Int63n(int64(d) / 5))
+	return d - d/10 + jitter
+}
+
 func isGroupExistsErr(err error) bool {
 	return err != nil && err.Error() == "BUSYGROUP Consumer Group name already exists"
+}
+
+// isNoGroupErr detects "NOGROUP" Redis errors — the stream key or its
+// consumer group no longer exists (typically because the key expired via TTL).
+func isNoGroupErr(err error) bool {
+	return redis.HasErrorPrefix(err, "NOGROUP")
 }
 
 // nopLogger is a no-op logger used when none is configured.

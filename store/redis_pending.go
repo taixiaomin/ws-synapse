@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -20,7 +21,7 @@ import (
 const (
 	DefaultKeyPrefix   = "ws:pending:"
 	DefaultMaxMessages = 500
-	DefaultTTL         = 24 * time.Hour
+	DefaultTTL         = 3 * time.Hour
 )
 
 // Wire-format prefix bytes for message type encoding.
@@ -119,7 +120,12 @@ func (s *RedisPendingStore) Push(ctx context.Context, connID string, data []byte
 func (s *RedisPendingStore) PushEnvelope(ctx context.Context, connID string, msg core.PendingMessage) error {
 	key := s.key(connID)
 	encoded := encode(msg)
-	return pushScript.Run(ctx, s.client, []string{key}, encoded, s.maxMessages, int(s.ttl.Seconds())).Err()
+	pipe := s.client.Pipeline()
+	pipe.RPush(ctx, key, encoded)
+	pipe.LTrim(ctx, key, -s.maxMessages, -1)
+	pipe.Expire(ctx, key, jitterTTL(s.ttl))
+	_, err := pipe.Exec(ctx)
+	return err
 }
 
 // PopAll atomically retrieves and removes all pending messages for a connection.
@@ -183,6 +189,15 @@ func decode(raw []byte) core.PendingMessage {
 		// Legacy data without prefix — treat as text.
 		return core.PendingMessage{Data: raw, MsgType: core.MsgTypeText}
 	}
+}
+
+// jitterTTL returns d with ±10% random jitter to prevent cache stampede.
+func jitterTTL(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	jitter := time.Duration(rand.Int63n(int64(d) / 5))
+	return d - d/10 + jitter
 }
 
 // Compile-time check.
