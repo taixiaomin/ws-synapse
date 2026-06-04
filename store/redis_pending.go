@@ -31,6 +31,28 @@ const (
 	prefixBinary byte = 0x02
 )
 
+// pushScript appends a message to the pending list, trims to the cap, and
+// installs the TTL only when the key does not already have one.
+//
+// Why not plain Pipeline(RPUSH, LTRIM, EXPIRE): the old code re-applied
+// EXPIRE on every push. For a connID that never came back, continued
+// pushes from Hub.Send / broadcastDirect would silently renew the TTL
+// forever — the key (and its memory) leak.
+//
+// With this script the TTL is set exactly once per key incarnation: at
+// first push (or immediately after PopAll DELs the key). The key then
+// expires s.ttl after its first incarnation, regardless of further pushes.
+//
+// Single-key script: Cluster-safe (all keys hash to the same slot).
+var pushScript = redis.NewScript(`
+redis.call('RPUSH', KEYS[1], ARGV[1])
+redis.call('LTRIM', KEYS[1], -tonumber(ARGV[2]), -1)
+if redis.call('TTL', KEYS[1]) == -1 then
+	redis.call('EXPIRE', KEYS[1], ARGV[3])
+end
+return 1
+`)
+
 // ── Options ─────────────────────────────────────────────────────────────────
 
 // Option configures a RedisPendingStore.
@@ -91,15 +113,16 @@ func (s *RedisPendingStore) Push(ctx context.Context, connID string, data []byte
 }
 
 // PushEnvelope stores a message with explicit type for an offline connection.
+//
+// TTL is installed only on first push to a fresh key (see pushScript). The key
+// then expires s.ttl after its first incarnation; subsequent pushes don't
+// renew it, so a connID that never reconnects can't leak memory indefinitely.
+// The TTL is jittered ±10% per first incarnation to spread expiry across time.
 func (s *RedisPendingStore) PushEnvelope(ctx context.Context, connID string, msg core.PendingMessage) error {
 	key := s.key(connID)
 	encoded := encode(msg)
-	pipe := s.client.Pipeline()
-	pipe.RPush(ctx, key, encoded)
-	pipe.LTrim(ctx, key, -s.maxMessages, -1)
-	pipe.Expire(ctx, key, jitterTTL(s.ttl))
-	_, err := pipe.Exec(ctx)
-	return err
+	ttlSeconds := int(jitterTTL(s.ttl).Seconds())
+	return pushScript.Run(ctx, s.client, []string{key}, encoded, s.maxMessages, ttlSeconds).Err()
 }
 
 // PopAll atomically retrieves and removes all pending messages for a connection.

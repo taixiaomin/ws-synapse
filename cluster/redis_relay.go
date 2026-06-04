@@ -25,18 +25,19 @@ type RedisClusterRelay struct {
 	client redis.Cmdable
 	nodeID string
 
-	handler           core.RelayHandler
-	pendingStore      core.PendingStore
-	logger            core.Logger
-	keyPrefix         string
-	streamMaxLen      int64
-	connTTL           time.Duration
-	nodeTTL           time.Duration
-	heartbeatInterval time.Duration
-	blockDuration     time.Duration
-	topicSharedTTL    time.Duration
-	topicTTL          time.Duration
-	streamTTL         time.Duration
+	handler                core.RelayHandler
+	pendingStore           core.PendingStore
+	logger                 core.Logger
+	keyPrefix              string
+	streamMaxLen           int64
+	connTTL                time.Duration
+	nodeTTL                time.Duration
+	heartbeatInterval      time.Duration
+	blockDuration          time.Duration
+	topicSharedTTL         time.Duration
+	staleNodeSweepInterval time.Duration
+	topicTTL               time.Duration
+	streamTTL              time.Duration
 
 	// localConns tracks connIDs registered on this node for TTL renewal.
 	localConns sync.Map // connID → struct{}
@@ -82,19 +83,20 @@ type topicSharedCacheEntry struct {
 // when the target node for a Send is unreachable.
 func NewRedisClusterRelay(client redis.Cmdable, pendingStore core.PendingStore, opts ...Option) *RedisClusterRelay {
 	r := &RedisClusterRelay{
-		client:            client,
-		nodeID:            uuid.New().String(),
-		pendingStore:      pendingStore,
-		keyPrefix:         defaultKeyPrefix,
-		streamMaxLen:      defaultStreamMaxLen,
-		connTTL:           defaultConnTTL,
-		nodeTTL:           defaultNodeTTL,
-		heartbeatInterval: defaultHeartbeatInterval,
-		blockDuration:     defaultBlockDuration,
-		topicSharedTTL:    defaultTopicSharedTTL,
-		topicTTL:          defaultTopicTTL,
-		streamTTL:         defaultStreamTTL,
-		stopCh:            make(chan struct{}),
+		client:                 client,
+		nodeID:                 uuid.New().String(),
+		pendingStore:           pendingStore,
+		keyPrefix:              defaultKeyPrefix,
+		streamMaxLen:           defaultStreamMaxLen,
+		connTTL:                defaultConnTTL,
+		nodeTTL:                defaultNodeTTL,
+		heartbeatInterval:      defaultHeartbeatInterval,
+		blockDuration:          defaultBlockDuration,
+		topicSharedTTL:         defaultTopicSharedTTL,
+		staleNodeSweepInterval: defaultStaleNodeSweepInterval,
+		topicTTL:               defaultTopicTTL,
+		streamTTL:              defaultStreamTTL,
+		stopCh:                 make(chan struct{}),
 	}
 	for _, fn := range opts {
 		fn(r)
@@ -134,6 +136,13 @@ func (r *RedisClusterRelay) Start(handler core.RelayHandler) error {
 	r.wg.Add(2)
 	go r.heartbeatLoop()
 	go r.consumeLoop()
+
+	// Optional: background sweep of orphan nodeIDs in topic sets. Skipped
+	// when the interval is non-positive so single-node tests can disable it.
+	if r.staleNodeSweepInterval > 0 {
+		r.wg.Add(1)
+		go r.staleNodeSweepLoop()
+	}
 
 	// Topic-share fast path: subscribe to membership-change events so the
 	// PublishBroadcast cache can be invalidated when remote nodes touch a
@@ -424,10 +433,30 @@ func (r *RedisClusterRelay) heartbeatLoop() {
 			// Refresh connection registrations in a pipeline — use Set (not Expire)
 			// to recreate keys that may have been cleaned up by other nodes during
 			// a transient Redis outage longer than connTTL.
+			//
+			// Also re-add this node to every topicKey set we believe we still
+			// subscribe to: a peer running staleNodeSweep may briefly see our
+			// nodeAlive key missing (Redis blip, mid-failover) and SRem us
+			// from a topic set even though we are alive. Without this refresh
+			// we'd silently stop receiving that topic's broadcasts until our
+			// local subscriber count next goes 0 → 1.
+			//
+			// Race trade-off: this can race with OnUnsubscribe (lastOnNode=true)
+			// — if OnUnsubscribe SRems first and our SAdd lands second, an
+			// orphan nodeID stays in topicKey until the next sweep. The sweep
+			// won't clean it (we're alive), so the orphan persists. The cost
+			// of an orphan is one wasted XAdd to our stream per broadcast,
+			// where LocalBroadcast finds no local subscribers and no-ops —
+			// not a correctness issue, just a small inefficiency.
 			pipe := r.client.Pipeline()
 			r.localConns.Range(func(key, _ any) bool {
 				connID := key.(string)
 				pipe.Set(ctx, r.connKey(connID), r.nodeID, r.connTTL)
+				return true
+			})
+			r.localTopics.Range(func(key, _ any) bool {
+				topic := key.(string)
+				pipe.SAdd(ctx, r.topicKey(topic), r.nodeID)
 				return true
 			})
 
@@ -441,6 +470,23 @@ func (r *RedisClusterRelay) heartbeatLoop() {
 			}
 
 			_, _ = pipe.Exec(ctx)
+
+			// Drop expired topicShared cache entries so the map doesn't grow
+			// unboundedly for topics this node no longer broadcasts to (those
+			// never trip the PublishBroadcast fast-path delete and never
+			// receive an OnUnsubscribe).
+			//
+			// CompareAndDelete (not plain Delete) guards against a race where
+			// PublishBroadcast.Store() lands between our Load and Delete:
+			// without it we would evict the fresh entry that just landed.
+			now := time.Now()
+			r.topicShared.Range(func(k, v any) bool {
+				entry, ok := v.(topicSharedCacheEntry)
+				if !ok || now.After(entry.expiresAt) {
+					r.topicShared.CompareAndDelete(k, v)
+				}
+				return true
+			})
 
 			cancel()
 		}
@@ -517,6 +563,92 @@ func (r *RedisClusterRelay) consumeLoop() {
 				_ = r.client.XAck(ackCtx, streamKey, defaultGroupName, ids...).Err()
 				ackCancel()
 			}
+		}
+	}
+}
+
+// staleNodeSweepLoop periodically removes dead nodeIDs from all topic sets.
+//
+// Why this exists: when a node crashes without running Stop(), its nodeAlive
+// key disappears (TTL expires) but the entries it left in ws:topic:<topic>
+// sets do not — Redis Sets have no per-member TTL. PublishBroadcast lazy-cleans
+// only the topics it broadcasts to (see the SRem in that path); a topic with
+// no live publisher on any node would retain the dead nodeID forever.
+//
+// The sweep SCANs ws:topic:* keys, SMEMBERS each, checks nodeAlive existence
+// for every distinct nodeID once, and SRems the dead ones. SRem is idempotent,
+// so two nodes sweeping concurrently is safe.
+//
+// Cluster mode: redis.Cmdable.Scan on a ClusterClient iterates every master
+// in turn, so the sweep eventually covers all shards.
+func (r *RedisClusterRelay) staleNodeSweepLoop() {
+	defer r.wg.Done()
+	ticker := time.NewTicker(r.staleNodeSweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-r.stopCh:
+			return
+		case <-ticker.C:
+			r.sweepStaleNodes()
+		}
+	}
+}
+
+func (r *RedisClusterRelay) sweepStaleNodes() {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pattern := r.keyPrefix + "topic:*"
+	aliveCache := make(map[string]bool)
+	var cursor uint64
+	for {
+		select {
+		case <-r.stopCh:
+			return
+		default:
+		}
+		keys, next, err := r.client.Scan(ctx, cursor, pattern, 100).Result()
+		if err != nil {
+			r.logger.Warn("stale-node sweep: scan failed", "error", err)
+			return
+		}
+		for _, topicKey := range keys {
+			nids, err := r.client.SMembers(ctx, topicKey).Result()
+			if err != nil {
+				r.logger.Warn("stale-node sweep: smembers failed", "topicKey", topicKey, "error", err)
+				continue
+			}
+			for _, nid := range nids {
+				if nid == r.nodeID {
+					continue
+				}
+				alive, cached := aliveCache[nid]
+				if !cached {
+					n, eErr := r.client.Exists(ctx, r.nodeAliveKeyFor(nid)).Result()
+					if eErr != nil {
+						// Conservative: assume alive on Redis error so a
+						// transient failure doesn't trigger a mass eviction.
+						aliveCache[nid] = true
+						continue
+					}
+					alive = n > 0
+					aliveCache[nid] = alive
+				}
+				if !alive {
+					if err := r.client.SRem(ctx, topicKey, nid).Err(); err != nil {
+						r.logger.Warn("stale-node sweep: srem failed",
+							"topicKey", topicKey, "deadNode", nid, "error", err)
+						continue
+					}
+					r.logger.Info("stale-node sweep: removed dead node",
+						"topicKey", topicKey, "deadNode", nid)
+				}
+			}
+		}
+		cursor = next
+		if cursor == 0 {
+			return
 		}
 	}
 }
