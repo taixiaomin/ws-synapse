@@ -443,25 +443,32 @@ func (s *Server) writePump(ctx context.Context, c *Conn) {
 func (s *Server) drainToPending(c *Conn) {
 	defer c.MarkDrained()
 
-	if s.hub.pendingStore == nil {
-		return
-	}
-	drainCtx, cancel := context.WithTimeout(context.Background(), s.opts.drainTimeout)
-	defer cancel()
-	for {
-		select {
-		case env := <-c.sendCh:
-			pm := PendingMessage{Data: env.Data, MsgType: envelopeToMsgType(env)}
-			if err := s.hub.pendingStore.PushEnvelope(drainCtx, c.ID(), pm); err != nil {
-				s.hub.logger.Error("drainToPending: push failed", "connID", c.ID(), "error", err)
-				return
-			}
-		case <-drainCtx.Done():
-			return
-		default:
-			return
-		}
-	}
+	// Reconnect/offline durability intentionally NOT supported: every connection
+	// gets a fresh connID (uuid), so a pending list keyed by connID can never be
+	// reclaimed by a later connection (flushPending always reads empty). Draining
+	// residual sendCh here only creates orphan Redis keys. The online overflow
+	// buffer (broadcast → pending → signalOverflow → drainOverflow on the SAME
+	// live conn) is unaffected. MarkDrained is still signalled above.
+	//
+	// if s.hub.pendingStore == nil {
+	// 	return
+	// }
+	// drainCtx, cancel := context.WithTimeout(context.Background(), s.opts.drainTimeout)
+	// defer cancel()
+	// for {
+	// 	select {
+	// 	case env := <-c.sendCh:
+	// 		pm := PendingMessage{Data: env.Data, MsgType: envelopeToMsgType(env)}
+	// 		if err := s.hub.pendingStore.PushEnvelope(drainCtx, c.ID(), pm); err != nil {
+	// 			s.hub.logger.Error("drainToPending: push failed", "connID", c.ID(), "error", err)
+	// 			return
+	// 		}
+	// 	case <-drainCtx.Done():
+	// 		return
+	// 	default:
+	// 		return
+	// 	}
+	// }
 }
 
 // drainOverflow pulls overflow messages from PendingStore and writes them to the
