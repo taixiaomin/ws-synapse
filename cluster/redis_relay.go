@@ -247,29 +247,53 @@ func (r *RedisClusterRelay) OnSubscribe(ctx context.Context, _, topic string) er
 	return nil
 }
 
-func (r *RedisClusterRelay) OnUnsubscribe(ctx context.Context, _, topic string, lastOnNode bool) error {
-	if lastOnNode {
-		r.localTopics.Delete(topic)
-		// We left the topic — drop any local belief about it; downstream
-		// PublishBroadcast on this node won't run for this topic anyway
-		// (no local subscribers), but keep the map clean.
-		r.topicShared.Delete(topic)
-		if err := r.client.SRem(ctx, r.topicKey(topic), r.nodeID).Err(); err != nil {
-			return err
-		}
-		if err := r.client.Publish(ctx, r.membershipChannel(), membershipMsgRemove+topic).Err(); err != nil {
-			r.logger.Warn("relay: membership publish (remove) failed", "topic", topic, "error", err)
-		}
+func (r *RedisClusterRelay) OnUnsubscribe(ctx context.Context, _, topic string, _ bool) error {
+	// NOTE: we intentionally do NOT use the Hub-supplied lastOnNode to decide
+	// whether to SRem this node from the topic set. lastOnNode is computed under
+	// the Hub's per-topic lock, but relay callbacks fire AFTER that lock is
+	// released and run on independent goroutines, so OnSubscribe/OnUnsubscribe
+	// for the same topic can be delivered out of order. If SAdd is gated on the
+	// relay's own count (OnSubscribe's !loaded) while SRem is gated on the Hub's
+	// lastOnNode, the two sources of truth diverge: a reordered first-subscribe
+	// can bump the relay count without SAdd-ing, after which a lastOnNode SRem
+	// removes this node even though it still has a live local subscriber. The
+	// node then stops receiving cross-node broadcasts for that topic and the
+	// heartbeat can't repair it (the localTopics entry was deleted), until the
+	// next 0→1 subscribe on this node for this topic.
+	//
+	// The relay's own count is order-insensitive: #OnSubscribe − #OnUnsubscribe
+	// always equals the current local subscriber count regardless of callback
+	// ordering. So drive SRem off the count reaching zero, matching OnSubscribe's
+	// SAdd off 0→1. lastOnNode is kept in the signature for API compatibility.
+	r.topicMu.Lock()
+	val, ok := r.localTopics.Load(topic)
+	if !ok {
+		r.topicMu.Unlock()
 		return nil
 	}
-	r.topicMu.Lock()
-	if val, ok := r.localTopics.Load(topic); ok {
-		cnt := val.(*int64)
-		if *cnt > 0 {
-			*cnt--
-		}
+	cnt := val.(*int64)
+	*cnt--
+	last := *cnt <= 0
+	if last {
+		r.localTopics.Delete(topic)
 	}
 	r.topicMu.Unlock()
+
+	if !last {
+		return nil
+	}
+
+	// Last local subscriber gone — drop the cache and remove this node from the
+	// topic set. If the SRem/SAdd Redis ops race with a concurrent re-subscribe,
+	// the heartbeat re-SAdds from localTopics within one interval, so any
+	// transient removal self-heals.
+	r.topicShared.Delete(topic)
+	if err := r.client.SRem(ctx, r.topicKey(topic), r.nodeID).Err(); err != nil {
+		return err
+	}
+	if err := r.client.Publish(ctx, r.membershipChannel(), membershipMsgRemove+topic).Err(); err != nil {
+		r.logger.Warn("relay: membership publish (remove) failed", "topic", topic, "error", err)
+	}
 	return nil
 }
 
@@ -469,7 +493,10 @@ func (r *RedisClusterRelay) heartbeatLoop() {
 				})
 			}
 
-			_, _ = pipe.Exec(ctx)
+			_, err := pipe.Exec(ctx)
+			if err != nil {
+				r.logger.Warn("heartbeat: pipeline failed", err.Error())
+			}
 
 			// Drop expired topicShared cache entries so the map doesn't grow
 			// unboundedly for topics this node no longer broadcasts to (those
