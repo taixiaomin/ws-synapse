@@ -270,28 +270,35 @@ func TestHub_Subscribe_Unsubscribe(t *testing.T) {
 	}
 }
 
-func TestHub_FlushPending_PreservesType(t *testing.T) {
-	ps := newMemPendingStore()
-	h := NewHub(WithHubPendingStore(ps))
-
-	// Buffer a binary message for offline user.
-	_ = ps.PushEnvelope(context.Background(), "u1", PendingMessage{Data: []byte{0xDE, 0xAD}, MsgType: MsgTypeBinary})
-	_ = ps.PushEnvelope(context.Background(), "u1", PendingMessage{Data: []byte("text"), MsgType: MsgTypeText})
-
-	c := testConn("u1")
-	c.hub = h
-	_ = h.register(context.Background(), c)
-
-	// Check both messages in sendCh.
-	env1 := <-c.sendCh
-	if env1.MsgType != 2 { // websocket.MessageBinary
-		t.Fatalf("expected binary, got %d", env1.MsgType)
-	}
-	env2 := <-c.sendCh
-	if env2.MsgType != 1 { // websocket.MessageText
-		t.Fatalf("expected text, got %d", env2.MsgType)
-	}
-}
+// Disabled: this fork intentionally does NOT flush pending on register.
+// connID is a fresh uuid per connection, so reconnect/offline durability can't
+// work (a pending list keyed by connID is never reclaimed); register() no longer
+// calls flushPending (see hub.go). The pending store is kept only as an online
+// burst-overflow buffer drained via signalOverflow → drainOverflow on the same
+// live conn, which this test does not exercise.
+//
+// func TestHub_FlushPending_PreservesType(t *testing.T) {
+// 	ps := newMemPendingStore()
+// 	h := NewHub(WithHubPendingStore(ps))
+//
+// 	// Buffer a binary message for offline user.
+// 	_ = ps.PushEnvelope(context.Background(), "u1", PendingMessage{Data: []byte{0xDE, 0xAD}, MsgType: MsgTypeBinary})
+// 	_ = ps.PushEnvelope(context.Background(), "u1", PendingMessage{Data: []byte("text"), MsgType: MsgTypeText})
+//
+// 	c := testConn("u1")
+// 	c.hub = h
+// 	_ = h.register(context.Background(), c)
+//
+// 	// Check both messages in sendCh.
+// 	env1 := <-c.sendCh
+// 	if env1.MsgType != 2 { // websocket.MessageBinary
+// 		t.Fatalf("expected binary, got %d", env1.MsgType)
+// 	}
+// 	env2 := <-c.sendCh
+// 	if env2.MsgType != 1 { // websocket.MessageText
+// 		t.Fatalf("expected text, got %d", env2.MsgType)
+// 	}
+// }
 
 func TestHub_Relay_RegisterUnregister(t *testing.T) {
 	relay := &mockRelay{}

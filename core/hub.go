@@ -298,9 +298,12 @@ func (h *Hub) register(ctx context.Context, c *Conn) error {
 		return ErrMaxConnsReached
 	}
 
-	// Flush pending BEFORE making the connection visible via conns.Store,
-	// so buffered messages land in sendCh before any new Broadcast/Send.
-	h.flushPending(ctx, c)
+	// Reconnect/offline durability intentionally unsupported: connID is a fresh
+	// uuid per connection, so this PopAll(connID) always returns empty. Skip the
+	// per-connect Redis LRANGE+DEL round-trip on the connection-setup hot path.
+	// (The online overflow buffer uses signalOverflow → drainOverflow, not
+	// flushPending, so this does not affect message delivery.)
+	// h.flushPending(ctx, c)
 	h.conns.Store(c.id, c)
 	h.connCount.Add(1)
 	h.metrics.IncConnections()
