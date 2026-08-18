@@ -115,10 +115,14 @@ func (s *Server) HandleHTTP(w http.ResponseWriter, r *http.Request) {
 	if s.opts.onUpgrade != nil {
 		info, err := s.opts.onUpgrade(r)
 		if err != nil {
+			s.opts.logger.Warn("websocket upgrade rejected by OnUpgrade hook",
+				"error", err, "origin", r.Header.Get("Origin"), "host", r.Host, "uri", r.RequestURI)
 			jsonError(w, err.Error(), http.StatusUnauthorized)
 			return
 		}
 		if info == nil {
+			s.opts.logger.Warn("websocket upgrade rejected: OnUpgrade returned no info",
+				"origin", r.Header.Get("Origin"), "host", r.Host)
 			jsonError(w, "connection id is required", http.StatusBadRequest)
 			return
 		}
@@ -178,6 +182,8 @@ func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, connID string, 
 	if s.opts.maxConnections > 0 &&
 		s.hub.ConnCount() >= int(s.opts.maxConnections) &&
 		s.hub.GetConn(connID) == nil {
+		s.opts.logger.Warn("websocket upgrade rejected: max connections reached",
+			"connCount", s.hub.ConnCount(), "maxConnections", s.opts.maxConnections)
 		jsonError(w, "max connections reached", http.StatusServiceUnavailable)
 		return
 	}
@@ -185,6 +191,8 @@ func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, connID string, 
 	// ── 2. Authentication
 	if s.opts.authenticator != nil {
 		if err := s.opts.authenticator(r); err != nil {
+			s.opts.logger.Warn("websocket upgrade rejected: authentication failed",
+				"error", err, "origin", r.Header.Get("Origin"), "host", r.Host)
 			jsonError(w, err.Error(), http.StatusUnauthorized)
 			return
 		}
@@ -199,6 +207,18 @@ func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, connID string, 
 	}
 	wsConn, err := websocket.Accept(w, r, acceptOpts)
 	if err != nil {
+		// Accept already wrote the HTTP error response. Log the cause here:
+		// the most common failure is an Origin header the policy rejects,
+		// which is otherwise invisible and surfaces to the browser as a bare
+		// 1006 close with no diagnostics.
+		s.opts.logger.Warn("websocket accept failed",
+			"error", err,
+			"origin", r.Header.Get("Origin"),
+			"host", r.Host,
+			"uri", r.RequestURI,
+			"forwardedProto", r.Header.Get("X-Forwarded-Proto"),
+			"insecureSkipVerify", s.opts.insecureSkipVerify,
+			"allowedOrigins", s.opts.allowedOrigins)
 		return
 	}
 	wsConn.SetReadLimit(s.opts.maxMessageSize)
