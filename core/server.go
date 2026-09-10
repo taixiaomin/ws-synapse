@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
 	"net"
 	"net/http"
 	"time"
@@ -13,11 +12,6 @@ import (
 	"github.com/coder/websocket"
 	"github.com/google/uuid"
 	"golang.org/x/time/rate"
-)
-
-const (
-	DatadogSpanId  = "X-Datadog-Span-Id"
-	DatadogTraceId = "X-Datadog-Trace-Id"
 )
 
 // NewServer creates a Server with the given EventHandler and options.
@@ -319,8 +313,13 @@ func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, connID string, 
 	// ── 9. Start pumps with an independent context (not tied to HTTP request).
 	// This prevents framework-specific request context cancellation from killing
 	// long-lived WebSocket connections. The context is cancelled when readPump exits.
+	//
+	// The context carries no trace ids. Correlating a connection's log lines is
+	// the application's job — it has conn.ID(), and it is the side that knows
+	// whether a real tracer is installed. A synthetic id put here would be read
+	// back as a trace id by a structured logger and point at a trace that was
+	// never recorded.
 	connCtx, connCancel := context.WithCancel(context.Background())
-	connCtx = context.WithValue(context.WithValue(connCtx, DatadogTraceId, rand.Uint64()&0x7FFFFFFFFFFFFFFF), DatadogSpanId, rand.Uint64()&0x7FFFFFFFFFFFFFFF)
 	s.wg.Add(2)
 	go s.writePump(connCtx, conn)
 	s.readPump(connCtx, connCancel, conn) // blocks
