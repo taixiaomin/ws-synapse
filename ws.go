@@ -26,6 +26,7 @@ type PendingMessage = core.PendingMessage
 // EventHandler Interfaces
 type EventHandler = core.EventHandler
 type TopicEventHandler = core.TopicEventHandler
+type RegisteredEventHandler = core.RegisteredEventHandler
 type MessageParser = core.MessageParser
 type Logger = core.Logger
 type MetricsCollector = core.MetricsCollector

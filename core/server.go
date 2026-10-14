@@ -310,6 +310,10 @@ func (s *Server) upgrade(w http.ResponseWriter, r *http.Request, connID string, 
 		s.metrics.IncReconnects()
 	}
 
+	// ── 8b. Fire OnRegistered (optional): the conn is now in the Hub, so
+	// Subscribe succeeds. Runs before the pumps start.
+	s.onRegistered(httpCtx, conn)
+
 	// ── 9. Start pumps with an independent context (not tied to HTTP request).
 	// This prevents framework-specific request context cancellation from killing
 	// long-lived WebSocket connections. The context is cancelled when readPump exits.
@@ -588,6 +592,23 @@ func (s *Server) onConnect(ctx context.Context, c *Conn) (err error) {
 		}
 	}()
 	return s.handler.OnConnect(ctx, c)
+}
+
+// onRegistered calls the handler's OnRegistered if it implements
+// RegisteredEventHandler. A panic is logged and swallowed: the connection is
+// already registered, so it stays up.
+func (s *Server) onRegistered(ctx context.Context, c *Conn) {
+	rh, ok := s.handler.(RegisteredEventHandler)
+	if !ok {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			s.opts.logger.Error("panic in OnRegistered", "connID", c.ID(), "panic", r)
+			s.metrics.IncErrors()
+		}
+	}()
+	rh.OnRegistered(ctx, c)
 }
 
 func (s *Server) onMessage(ctx context.Context, c *Conn, msg *Message) (err error) {

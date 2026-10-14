@@ -5,7 +5,10 @@ import "context"
 // EventHandler defines lifecycle callbacks that business code implements.
 type EventHandler interface {
 	// OnConnect is fired when a new connection is accepted, BEFORE it is
-	// registered in the Hub. conn.Hub() is available for Subscribe/Send etc.
+	// registered in the Hub. conn.Send works (messages are queued until the
+	// write pump starts), but conn.Subscribe does not: the Hub rejects a
+	// connection it has not registered yet. Subscribe in OnRegistered instead
+	// (see RegisteredEventHandler), or later from OnMessage.
 	// Return a non-nil error to reject the connection.
 	OnConnect(ctx context.Context, conn *Conn) error
 
@@ -32,6 +35,23 @@ type TopicEventHandler interface {
 	// OnUnsubscribe is called after a connection is removed from a topic.
 	// This includes automatic unsubscription on disconnect.
 	OnUnsubscribe(ctx context.Context, connID, topic string)
+}
+
+// RegisteredEventHandler is an optional interface that EventHandler
+// implementations may also implement to act on a connection once the Hub has
+// registered it. The Server checks for this interface at runtime; it is NOT
+// required.
+type RegisteredEventHandler interface {
+	// OnRegistered is called after the connection is registered in the Hub and
+	// before its read/write pumps start, so it is the earliest point where
+	// conn.Subscribe succeeds. Typical use: subscribe the connection to the
+	// topics its identity implies, then push an initial snapshot.
+	//
+	// It runs synchronously on the upgrade path: messages sent here are queued
+	// and delivered once the write pump starts, after anything queued in
+	// OnConnect. Keep it short; hand long work to a goroutine. To drop the
+	// connection, call conn.Close.
+	OnRegistered(ctx context.Context, conn *Conn)
 }
 
 // MessageParser extracts the message type from raw inbound bytes.
