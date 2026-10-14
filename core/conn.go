@@ -339,9 +339,16 @@ func (c *Conn) WriteEnvelope(ctx context.Context, env MessageEnvelope, timeout t
 
 // Close sends a close frame.
 func (c *Conn) Close(reason string) {
+	_ = c.CloseWithStatus(int(websocket.StatusNormalClosure), reason)
+}
+
+// CloseWithStatus sends a close frame carrying code, which the browser exposes
+// as CloseEvent.code. Use 4000-4999 for application-defined codes. reason must
+// fit in 123 bytes, otherwise the peer receives 1011 and an error is returned.
+func (c *Conn) CloseWithStatus(code int, reason string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	_ = c.ws.Close(websocket.StatusNormalClosure, reason)
+	return c.ws.Close(websocket.StatusCode(code), reason)
 }
 
 // CloseNow forcefully closes without a close frame.
