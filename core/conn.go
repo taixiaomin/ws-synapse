@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -66,6 +67,9 @@ type Conn struct {
 	// per-topic locks, so cleanup scales linearly.
 	subsMu sync.Mutex
 	subs   map[string]struct{}
+
+	connectedAt time.Time                 // when the connection object was created
+	closeInfo   atomic.Pointer[CloseInfo] // first recorded cause of the connection's end
 }
 
 // signalOverflow wakes writePump to drain PendingStore. Callers must invoke
@@ -148,11 +152,18 @@ func NewConn(id, token string, ws *websocket.Conn, chSize int, limiter *rate.Lim
 		drained:     make(chan struct{}),
 		overflowSig: make(chan struct{}, 1),
 		limiter:     limiter,
+		connectedAt: time.Now(),
 	}
 }
 
 // ID returns the unique client identifier for this connection.
 func (c *Conn) ID() string { return c.id }
+
+// ConnectedAt returns when the connection was established.
+func (c *Conn) ConnectedAt() time.Time { return c.connectedAt }
+
+// QueuedMessages returns how many messages are waiting in the outbound queue.
+func (c *Conn) QueuedMessages() int { return len(c.sendCh) }
 
 // Token returns the server-generated reconnect token.
 // The client should persist this and send it back on reconnect.

@@ -50,6 +50,10 @@ type serverOptions struct {
 	// heartbeat ping interval, default 54s
 	pingInterval time.Duration
 
+	// how long a heartbeat ping waits for its pong before the connection is dropped,
+	// default writeTimeout
+	pongTimeout time.Duration
+
 	// offline message store, nil = disabled
 	pendingStore PendingStore
 
@@ -143,6 +147,9 @@ func (o *serverOptions) validate() {
 	if o.pingInterval <= 0 {
 		o.pingInterval = 54 * time.Second
 	}
+	if o.pongTimeout <= 0 {
+		o.pongTimeout = o.writeTimeout
+	}
 	if o.maxMessageSize <= 0 {
 		o.maxMessageSize = 32 * 1024
 	}
@@ -181,6 +188,13 @@ func WithWriteTimeout(d time.Duration) ServerOption {
 // WithPingInterval sets the heartbeat ping interval (default 54s).
 func WithPingInterval(d time.Duration) ServerOption {
 	return func(o *serverOptions) { o.pingInterval = d }
+}
+
+// WithPongTimeout sets how long a heartbeat ping waits for its pong before the
+// connection is dropped (default: the write timeout). A client whose read loop falls
+// further behind than this is disconnected with CloseReasonPingTimeout.
+func WithPongTimeout(d time.Duration) ServerOption {
+	return func(o *serverOptions) { o.pongTimeout = d }
 }
 
 // WithPendingStore enables offline message buffering with the given store.

@@ -22,6 +22,23 @@ type ServerOption = core.ServerOption
 type UpgradeInfo = core.UpgradeInfo
 type PreparedMessage = core.PreparedMessage
 type PendingMessage = core.PendingMessage
+type CloseReason = core.CloseReason
+type CloseInfo = core.CloseInfo
+
+// Close reasons reported by Conn.CloseInfo.
+const (
+	CloseReasonNone           = core.CloseReasonNone
+	CloseReasonClientClose    = core.CloseReasonClientClose
+	CloseReasonClientGone     = core.CloseReasonClientGone
+	CloseReasonPingTimeout    = core.CloseReasonPingTimeout
+	CloseReasonWriteTimeout   = core.CloseReasonWriteTimeout
+	CloseReasonWriteError     = core.CloseReasonWriteError
+	CloseReasonReadLimit      = core.CloseReasonReadLimit
+	CloseReasonReadError      = core.CloseReasonReadError
+	CloseReasonReplaced       = core.CloseReasonReplaced
+	CloseReasonServerClose    = core.CloseReasonServerClose
+	CloseReasonServerShutdown = core.CloseReasonServerShutdown
+)
 
 // EventHandler Interfaces
 type EventHandler = core.EventHandler
@@ -30,6 +47,7 @@ type RegisteredEventHandler = core.RegisteredEventHandler
 type MessageParser = core.MessageParser
 type Logger = core.Logger
 type MetricsCollector = core.MetricsCollector
+type CloseReasonCollector = core.CloseReasonCollector
 type PendingStore = core.PendingStore
 type TokenProvider = core.TokenProvider
 type ClusterRelay = core.ClusterRelay
@@ -92,6 +110,7 @@ var (
 	WithSendChannelSize    = core.WithSendChannelSize
 	WithWriteTimeout       = core.WithWriteTimeout
 	WithPingInterval       = core.WithPingInterval
+	WithPongTimeout        = core.WithPongTimeout
 	WithPendingStore       = core.WithPendingStore
 	WithInsecureSkipVerify = core.WithInsecureSkipVerify
 	WithAllowedOrigins     = core.WithAllowedOrigins

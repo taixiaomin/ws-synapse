@@ -274,6 +274,7 @@ func (h *Hub) register(ctx context.Context, c *Conn) error {
 	old, replacing := h.conns.LoadAndDelete(c.id)
 	if replacing {
 		o := old.(*Conn)
+		o.recordClose(CloseReasonReplaced, -1, nil)
 		o.Close("replaced")
 		o.Finish()
 		h.connCount.Add(-1)
@@ -794,6 +795,7 @@ func (h *Hub) CloseTopic(ctx context.Context, topic string, data []byte) {
 func (h *Hub) CloseConn(connID, reason string) {
 	if val, loaded := h.conns.LoadAndDelete(connID); loaded {
 		c := val.(*Conn)
+		c.recordClose(CloseReasonServerClose, -1, nil)
 		c.Close(reason)
 		c.Finish()
 		h.connCount.Add(-1)
@@ -918,6 +920,7 @@ func (h *Hub) Shutdown(ctx context.Context, finalMessage ...[]byte) {
 		if msg != nil {
 			c.Send(msg)
 		}
+		c.recordClose(CloseReasonServerShutdown, -1, nil)
 		c.Close("server shutdown")
 		c.Finish()
 		h.conns.Delete(key)

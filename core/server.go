@@ -100,6 +100,7 @@ func (s *Server) Shutdown(ctx context.Context, finalMessage ...[]byte) {
 	case <-ctx.Done():
 		// Timeout: force-close all connections to unblock stuck readPump goroutines.
 		for _, c := range allConns {
+			c.recordClose(CloseReasonServerShutdown, -1, nil)
 			c.CloseNow()
 		}
 	}
@@ -336,6 +337,10 @@ func (s *Server) readPump(ctx context.Context, connCancel context.CancelFunc, c 
 		if r := recover(); r != nil {
 			s.opts.logger.Error("panic in readPump", "connID", c.ID(), "panic", r)
 			s.metrics.IncErrors()
+			c.recordClose(CloseReasonReadError, -1, fmt.Errorf("panic in readPump: %v", r))
+		}
+		if rc, ok := s.metrics.(CloseReasonCollector); ok {
+			rc.IncCloses(c.CloseInfo().Reason)
 		}
 
 		removed := s.hub.unregister(c)
@@ -361,6 +366,17 @@ func (s *Server) readPump(ctx context.Context, connCancel context.CancelFunc, c 
 	for {
 		_, data, err := c.ws.Read(ctx)
 		if err != nil {
+			reason, code := readCloseReason(err)
+			if errors.Is(err, net.ErrClosed) && c.CloseInfo().Reason == CloseReasonNone {
+				// Closed on this side with no cause recorded yet: a write timed out. The
+				// websocket library closes the socket before the failed Write returns, so
+				// the reader can see it first. Let the write pump record the real cause.
+				select {
+				case <-c.Drained():
+				case <-time.After(s.opts.writeTimeout):
+				}
+			}
+			c.recordClose(reason, code, err)
 			if !isBenignClose(err) {
 				s.onError(ctx, c, err)
 				s.metrics.IncErrors()
@@ -434,6 +450,7 @@ func (s *Server) writePump(ctx context.Context, c *Conn) {
 		if r := recover(); r != nil {
 			s.opts.logger.Error("panic in writePump", "connID", c.ID(), "panic", r)
 			s.metrics.IncErrors()
+			c.recordClose(CloseReasonWriteError, -1, fmt.Errorf("panic in writePump: %v", r))
 		}
 		ticker.Stop()
 		s.drainToPending(c)
@@ -451,16 +468,14 @@ func (s *Server) writePump(ctx context.Context, c *Conn) {
 	for {
 		select {
 		case data := <-c.sendCh:
-			if err := c.WriteEnvelope(ctx, data, s.opts.writeTimeout); err != nil {
+			if !s.write(ctx, c, data) {
 				return
 			}
-			s.metrics.IncMessagesOut()
 			// Batch flush: write any messages already queued in the buffer.
 			for n := len(c.sendCh); n > 0; n-- {
-				if err := c.WriteEnvelope(ctx, <-c.sendCh, s.opts.writeTimeout); err != nil {
+				if !s.write(ctx, c, <-c.sendCh) {
 					return
 				}
-				s.metrics.IncMessagesOut()
 			}
 
 		case <-c.overflowSig:
@@ -469,18 +484,20 @@ func (s *Server) writePump(ctx context.Context, c *Conn) {
 			// could otherwise pick this case while sendCh still has buffered
 			// items; this loop restores best-effort relative ordering.
 			for n := len(c.sendCh); n > 0; n-- {
-				if err := c.WriteEnvelope(ctx, <-c.sendCh, s.opts.writeTimeout); err != nil {
+				if !s.write(ctx, c, <-c.sendCh) {
 					return
 				}
-				s.metrics.IncMessagesOut()
 			}
 			s.drainOverflow(ctx, c)
 
 		case <-ticker.C:
-			pingCtx, cancel := context.WithTimeout(ctx, s.opts.writeTimeout)
+			// Ping waits for the pong, so its deadline is how long an unresponsive
+			// client is tolerated, not how long the ping frame takes to write.
+			pingCtx, cancel := context.WithTimeout(ctx, s.opts.pongTimeout)
 			err := c.ws.Ping(pingCtx)
 			cancel()
 			if err != nil {
+				c.recordClose(writeCloseReason(err, true), -1, err)
 				return
 			}
 
@@ -491,6 +508,17 @@ func (s *Server) writePump(ctx context.Context, c *Conn) {
 			return
 		}
 	}
+}
+
+// write sends one envelope and reports whether the write pump should keep going. A
+// failed write records why the connection ends before the pump closes it.
+func (s *Server) write(ctx context.Context, c *Conn, env MessageEnvelope) bool {
+	if err := c.WriteEnvelope(ctx, env, s.opts.writeTimeout); err != nil {
+		c.recordClose(writeCloseReason(err, false), -1, err)
+		return false
+	}
+	s.metrics.IncMessagesOut()
+	return true
 }
 
 // drainToPending saves remaining messages in sendCh to the pending store.
