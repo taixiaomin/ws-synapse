@@ -73,11 +73,12 @@ func TestDeadTopicMember_FilteredAndPruned(t *testing.T) {
 	}
 	defer relayB.Stop()
 
-	// A crashed node that never left the topic.
-	if err := client.ZAdd(ctx, "ws:topicz:room", redis.Z{Score: 1, Member: "dead-node"}).Err(); err != nil {
+	if err := relayB.OnSubscribe(ctx, "cb", "room"); err != nil {
 		t.Fatal(err)
 	}
-	if err := relayB.OnSubscribe(ctx, "cb", "room"); err != nil {
+	// A crashed node that never left the topic. Added after B joined, so only
+	// B's heartbeat (not its join) can prune it.
+	if err := client.ZAdd(ctx, "ws:topicz:room", redis.Z{Score: 1, Member: "dead-node"}).Err(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -91,8 +92,7 @@ func TestDeadTopicMember_FilteredAndPruned(t *testing.T) {
 		t.Fatal("broadcast must not create a stream for a dead node")
 	}
 
-	// B's heartbeat prunes the dead member (topicTouchScript): already done by
-	// OnSubscribe's touch, and kept that way by every heartbeat.
+	// B's next heartbeat prunes the dead member (topicTouchScript).
 	if !pollUntil(t, 2*time.Second, func() bool {
 		got := topicMembers(t, client, "room")
 		return len(got) == 1 && got[0] == relayB.NodeID()
@@ -203,33 +203,6 @@ func TestHeartbeat_DoesNotOverwriteForeignRoute(t *testing.T) {
 	}
 	if v, _ := client.Get(ctx, "ws:conn:moved").Result(); v != "other-node" {
 		t.Fatalf("heartbeat overwrote another node's route: %q", v)
-	}
-}
-
-// Sending to a connID whose node is dead buffers the message, removes the
-// stale route only if it still names the dead node, and creates no stream.
-func TestPublishSend_DeadNode_NoStreamCreated(t *testing.T) {
-	_, client := setupMiniredis(t)
-	ctx := context.Background()
-	pending := newMockPendingStore()
-	relay := NewRedisClusterRelay(client, pending, fastOpts()...)
-	if err := relay.Start(&mockRelayHandler{}); err != nil {
-		t.Fatal(err)
-	}
-	defer relay.Stop()
-
-	client.Set(ctx, "ws:conn:c1", "dead-node", time.Minute)
-	if err := relay.PublishSend(ctx, "c1", []byte("x")); err != nil {
-		t.Fatalf("PublishSend: %v", err)
-	}
-	if got := pending.getItems("c1"); len(got) != 1 {
-		t.Fatalf("message not buffered: %v", got)
-	}
-	if n, _ := client.Exists(ctx, "ws:conn:c1").Result(); n != 0 {
-		t.Fatal("stale route to dead node should be removed")
-	}
-	if n, _ := client.Exists(ctx, "ws:stream:dead-node").Result(); n != 0 {
-		t.Fatal("PublishSend must not create a stream for a dead node")
 	}
 }
 

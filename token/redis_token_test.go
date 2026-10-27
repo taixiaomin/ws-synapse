@@ -59,7 +59,7 @@ func TestRedisTokenProvider(t *testing.T) {
 		_, client := setupRedis(t)
 		p := NewRedisTokenProvider(client)
 
-		_, err := p.Generate(ctx, "conn1")
+		tok, err := p.Generate(ctx, "conn1")
 		if err != nil {
 			t.Fatalf("Generate: %v", err)
 		}
@@ -68,7 +68,9 @@ func TestRedisTokenProvider(t *testing.T) {
 			t.Fatalf("Revoke: %v", err)
 		}
 
-		ok, err := p.Validate(ctx, "conn1", "anything")
+		// Validate the real token: checking a made-up one would pass even if
+		// Revoke did nothing.
+		ok, err := p.Validate(ctx, "conn1", tok)
 		if err != nil {
 			t.Fatalf("Validate: %v", err)
 		}

@@ -356,6 +356,11 @@ func TestPublishSend_DeadNode_FallsToPendingAndCleansRegistry(t *testing.T) {
 	if err != redis.Nil {
 		t.Errorf("expected conn key to be deleted, got val=%q err=%v", val, err)
 	}
+
+	// And no stream may be created for the dead node (XADD NOMKSTREAM).
+	if n, _ := client.Exists(ctx, "ws:stream:"+fakeNodeID).Result(); n != 0 {
+		t.Error("PublishSend must not create a stream for a dead node")
+	}
 }
 
 func TestOnSubscribe_OnUnsubscribe_TopicSets(t *testing.T) {
@@ -692,5 +697,62 @@ func TestPublishBroadcast_TopicSharedTTLRefreshesWithoutMembershipPubSub(t *test
 
 	if !ok {
 		t.Fatal("timed out waiting for cross-node broadcast after topicShared TTL refresh")
+	}
+}
+
+// The primary invalidation path: relay A has cached the topic as local-only;
+// when B joins, its "+" membership event must clear A's cache so the very next
+// broadcast reaches B — long before the cache TTL would have expired.
+func TestPublishBroadcast_MembershipEventInvalidatesLocalOnlyCache(t *testing.T) {
+	_, client := setupMiniredis(t)
+
+	handlerA := &mockRelayHandler{}
+	handlerB := &mockRelayHandler{}
+	relayA := NewRedisClusterRelay(client, nil, append(fastOpts(), WithTopicSharedTTL(time.Hour))...)
+	relayB := NewRedisClusterRelay(client, nil, fastOpts()...)
+	if err := relayA.Start(handlerA); err != nil {
+		t.Fatalf("relayA.Start: %v", err)
+	}
+	if err := relayB.Start(handlerB); err != nil {
+		t.Fatalf("relayB.Start: %v", err)
+	}
+	defer relayA.Stop()
+	defer relayB.Stop()
+
+	ctx := context.Background()
+	topic := "room:invalidate"
+
+	if err := relayA.OnSubscribe(ctx, "conn-a", topic); err != nil {
+		t.Fatalf("relayA.OnSubscribe: %v", err)
+	}
+	if err := relayA.PublishBroadcast(ctx, topic, []byte("prime"), nil); err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+	if v, ok := relayA.topicShared.Load(topic); !ok || v.(topicSharedCacheEntry).shared {
+		t.Fatal("A should have cached the topic as local-only")
+	}
+
+	if err := relayB.OnSubscribe(ctx, "conn-b", topic); err != nil {
+		t.Fatalf("relayB.OnSubscribe: %v", err)
+	}
+	if !pollUntil(t, 2*time.Second, func() bool {
+		_, cached := relayA.topicShared.Load(topic)
+		return !cached
+	}) {
+		t.Fatal("B's membership event did not invalidate A's cache")
+	}
+
+	if err := relayA.PublishBroadcast(ctx, topic, []byte("after-join"), nil); err != nil {
+		t.Fatalf("PublishBroadcast: %v", err)
+	}
+	if !pollUntil(t, 3*time.Second, func() bool {
+		for _, b := range handlerB.getBroadcasts() {
+			if string(b.Data) == "after-join" {
+				return true
+			}
+		}
+		return false
+	}) {
+		t.Fatal("broadcast after B joined did not reach B")
 	}
 }

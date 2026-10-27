@@ -10,6 +10,13 @@ import (
 	"github.com/taixiaomin/ws-synapse/core"
 )
 
+func mustPush(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("push: %v", err)
+	}
+}
+
 func setup(t *testing.T, opts ...Option) (*RedisPendingStore, *miniredis.Miniredis) {
 	t.Helper()
 	mr := miniredis.RunT(t)
@@ -64,9 +71,9 @@ func TestMixedMessages_PreserveOrderAndTypes(t *testing.T) {
 	s, _ := setup(t)
 	ctx := context.Background()
 
-	s.Push(ctx, "c1", []byte("text1"))
-	s.PushEnvelope(ctx, "c1", core.PendingMessage{Data: []byte{0xFF}, MsgType: core.MsgTypeBinary})
-	s.Push(ctx, "c1", []byte("text2"))
+	mustPush(t, s.Push(ctx, "c1", []byte("text1")))
+	mustPush(t, s.PushEnvelope(ctx, "c1", core.PendingMessage{Data: []byte{0xFF}, MsgType: core.MsgTypeBinary}))
+	mustPush(t, s.Push(ctx, "c1", []byte("text2")))
 
 	msgs, err := s.PopAll(ctx, "c1")
 	if err != nil {
@@ -95,7 +102,7 @@ func TestPopAll_Atomic_SecondCallReturnsNil(t *testing.T) {
 	s, _ := setup(t)
 	ctx := context.Background()
 
-	s.Push(ctx, "c1", []byte("msg"))
+	mustPush(t, s.Push(ctx, "c1", []byte("msg")))
 
 	msgs, _ := s.PopAll(ctx, "c1")
 	if len(msgs) != 1 {
@@ -116,7 +123,7 @@ func TestMaxMessages_Trimming(t *testing.T) {
 	ctx := context.Background()
 
 	for i := 0; i < 5; i++ {
-		s.Push(ctx, "c1", []byte{byte('a' + i)})
+		mustPush(t, s.Push(ctx, "c1", []byte{byte('a' + i)}))
 	}
 
 	msgs, err := s.PopAll(ctx, "c1")
@@ -174,9 +181,12 @@ func TestTTL_ExpiresMessages(t *testing.T) {
 	s, mr := setup(t, WithTTL(10*time.Second))
 	ctx := context.Background()
 
-	s.Push(ctx, "c1", []byte("ephemeral"))
+	mustPush(t, s.Push(ctx, "c1", []byte("ephemeral")))
+	if !mr.Exists(DefaultKeyPrefix + "c1") {
+		t.Fatal("message was not stored")
+	}
 
-	mr.FastForward(11 * time.Second)
+	mr.FastForward(11 * time.Second) // TTL is jittered to [9s, 11s)
 
 	msgs, err := s.PopAll(ctx, "c1")
 	if err != nil {
@@ -248,5 +258,30 @@ func TestPushFront_TypeCapAndTTL(t *testing.T) {
 	}
 	if len(got) != 2 || string(got[0].Data) != "b" || got[0].MsgType != core.MsgTypeBinary || string(got[1].Data) != "c" {
 		t.Fatalf("got %+v, want newest two [b(binary) c]", got)
+	}
+}
+
+// The TTL is installed once per key incarnation; later pushes must not renew
+// it, or a connID that never comes back keeps its key (and memory) forever.
+func TestTTL_NotRenewedBySubsequentPushes(t *testing.T) {
+	s, mr := setup(t, WithTTL(10*time.Second))
+	ctx := context.Background()
+	key := DefaultKeyPrefix + "c1"
+
+	mustPush(t, s.Push(ctx, "c1", []byte("first")))
+	first := mr.TTL(key)
+	if first <= 0 {
+		t.Fatalf("first push must set a TTL, got %v", first)
+	}
+
+	mr.FastForward(5 * time.Second)
+	mustPush(t, s.Push(ctx, "c1", []byte("second")))
+	if got := mr.TTL(key); got > first-5*time.Second {
+		t.Fatalf("TTL was renewed by the second push: %v, want <= %v", got, first-5*time.Second)
+	}
+
+	mr.FastForward(first - 5*time.Second)
+	if mr.Exists(key) {
+		t.Fatal("key must expire at its first incarnation's TTL")
 	}
 }

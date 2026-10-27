@@ -2,8 +2,14 @@ package core
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/coder/websocket"
 )
 
 // ── Mock PendingStore ────────────────────────────────────────────────────────
@@ -277,35 +283,56 @@ func TestHub_Subscribe_Unsubscribe(t *testing.T) {
 	}
 }
 
-// Disabled: this fork intentionally does NOT flush pending on register.
-// connID is a fresh uuid per connection, so reconnect/offline durability can't
-// work (a pending list keyed by connID is never reclaimed); register() no longer
-// calls flushPending (see hub.go). The pending store is kept only as an online
-// burst-overflow buffer drained via signalOverflow → drainOverflow on the same
-// live conn, which this test does not exercise.
-//
-// func TestHub_FlushPending_PreservesType(t *testing.T) {
-// 	ps := newMemPendingStore()
-// 	h := NewHub(WithHubPendingStore(ps))
-//
-// 	// Buffer a binary message for offline user.
-// 	_ = ps.PushEnvelope(context.Background(), "u1", PendingMessage{Data: []byte{0xDE, 0xAD}, MsgType: MsgTypeBinary})
-// 	_ = ps.PushEnvelope(context.Background(), "u1", PendingMessage{Data: []byte("text"), MsgType: MsgTypeText})
-//
-// 	c := testConn("u1")
-// 	c.hub = h
-// 	_ = h.register(context.Background(), c)
-//
-// 	// Check both messages in sendCh.
-// 	env1 := <-c.sendCh
-// 	if env1.MsgType != 2 { // websocket.MessageBinary
-// 		t.Fatalf("expected binary, got %d", env1.MsgType)
-// 	}
-// 	env2 := <-c.sendCh
-// 	if env2.MsgType != 1 { // websocket.MessageText
-// 		t.Fatalf("expected text, got %d", env2.MsgType)
-// 	}
-// }
+// register intentionally does not flush the PendingStore: connIDs are fresh
+// per connection, so a buffer keyed by connID is never reclaimed by a later
+// connection (see hub.go). This pins that contract.
+func TestHub_Register_DoesNotFlushPending(t *testing.T) {
+	ps := newMemPendingStore()
+	h := NewHub(WithHubPendingStore(ps))
+	_ = ps.PushEnvelope(context.Background(), "u1", PendingMessage{Data: []byte("old"), MsgType: MsgTypeText})
+
+	c := testConn("u1")
+	c.hub = h
+	if err := h.register(context.Background(), c); err != nil {
+		t.Fatal(err)
+	}
+	if len(c.sendCh) != 0 {
+		t.Fatalf("register must not deliver pending messages, sendCh has %d", len(c.sendCh))
+	}
+	if ps.count("u1") != 1 {
+		t.Fatalf("register must not pop the pending store, count = %d", ps.count("u1"))
+	}
+}
+
+// flushPending is not called by register, but it is kept for callers that do
+// replay; it must preserve type and order, and put what doesn't fit back at
+// the head of the store.
+func TestHub_FlushPending_PreservesTypeOrderAndRequeuesFront(t *testing.T) {
+	ps := newMemPendingStore()
+	h := NewHub(WithHubPendingStore(ps), WithHubLogger(NopLogger{}))
+	ctx := context.Background()
+	_ = ps.PushEnvelope(ctx, "u1", PendingMessage{Data: []byte{0xDE, 0xAD}, MsgType: MsgTypeBinary})
+	_ = ps.PushEnvelope(ctx, "u1", PendingMessage{Data: []byte("t1"), MsgType: MsgTypeText})
+	_ = ps.PushEnvelope(ctx, "u1", PendingMessage{Data: []byte("t2"), MsgType: MsgTypeText})
+	_ = ps.PushEnvelope(ctx, "u1", PendingMessage{Data: []byte("t3"), MsgType: MsgTypeText})
+
+	c := testConn("u1")
+	c.sendCh = make(chan MessageEnvelope, 2) // room for two of the four
+	h.flushPending(ctx, c)
+
+	env := <-c.sendCh
+	if env.MsgType != websocket.MessageBinary || string(env.Data) != "\xde\xad" {
+		t.Fatalf("first = %v %q, want binary dead", env.MsgType, env.Data)
+	}
+	env = <-c.sendCh
+	if env.MsgType != websocket.MessageText || string(env.Data) != "t1" {
+		t.Fatalf("second = %v %q, want text t1", env.MsgType, env.Data)
+	}
+	rest, _ := ps.PopAll(ctx, "u1")
+	if len(rest) != 2 || string(rest[0].Data) != "t2" || string(rest[1].Data) != "t3" {
+		t.Fatalf("requeued = %+v, want [t2 t3] in order", rest)
+	}
+}
 
 func TestHub_Relay_RegisterUnregister(t *testing.T) {
 	relay := &mockRelay{}
@@ -580,35 +607,96 @@ func TestHub_MaxConns(t *testing.T) {
 	}
 }
 
+// wsConn returns the server side of a live WebSocket connection. The client
+// side keeps reading so close handshakes complete immediately.
+func wsConn(t *testing.T) *websocket.Conn {
+	t.Helper()
+	accepted := make(chan *websocket.Conn, 1)
+	hs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		accepted <- c
+		<-r.Context().Done()
+	}))
+	t.Cleanup(hs.Close)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	client, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(hs.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { _ = client.CloseNow() })
+	go func() {
+		for {
+			if _, _, err := client.Read(context.Background()); err != nil {
+				return
+			}
+		}
+	}()
+	select {
+	case c := <-accepted:
+		t.Cleanup(func() { _ = c.CloseNow() })
+		return c
+	case <-time.After(3 * time.Second):
+		t.Fatal("server side not accepted")
+		return nil
+	}
+}
+
+// Registering a second conn with the same connID replaces the first: the old
+// conn is closed as replaced, its subscriptions are dropped, and its own late
+// unregister must not remove the new conn.
 func TestHub_ConnectionReplacement(t *testing.T) {
-	ps := newMemPendingStore()
-	h := NewHub(WithHubPendingStore(ps))
+	relay := &mockRelay{}
+	h := NewHub(WithHubClusterRelay(relay), WithHubLogger(NopLogger{}))
 	ctx := context.Background()
 
 	c1 := testConn("u1")
+	c1.ws = wsConn(t)
 	c1.hub = h
-	_ = h.register(ctx, c1)
-	// Simulate what would happen in production: writePump exits and marks drained.
-	c1.Finish()
-	c1.MarkDrained()
+	if err := h.register(ctx, c1); err != nil {
+		t.Fatal(err)
+	}
+	h.Subscribe(ctx, c1, "room")
+	c1.MarkDrained() // its writePump has nothing left to drain
 
 	c2 := testConn("u1")
 	c2.hub = h
-	// register will call o.Close which panics on nil ws.
-	// Since c1 is already Finished, register skips Close (via LoadAndDelete finding it).
-	// Actually register calls o.Close("replaced") on the old conn which has nil ws.
-	// This is a test-only issue. Just verify the logic by checking state after.
-	// We pre-finish c1 so the Done channel is closed, which means register
-	// will still try to Close the nil ws. Let's just test the state management
-	// part by directly testing conns.Store.
-	h.conns.Store("u1", c2)
-	h.connCount.Store(1)
+	if err := h.register(ctx, c2); err != nil {
+		t.Fatal(err)
+	}
 
 	if h.GetConn("u1") != c2 {
-		t.Fatal("should have new conn")
+		t.Fatal("GetConn should return the new conn")
 	}
 	if h.ConnCount() != 1 {
-		t.Fatalf("expected 1, got %d", h.ConnCount())
+		t.Fatalf("ConnCount = %d, want 1", h.ConnCount())
+	}
+	select {
+	case <-c1.Done():
+	default:
+		t.Fatal("old conn should be finished")
+	}
+	if got := c1.CloseInfo().Reason; got != CloseReasonReplaced {
+		t.Fatalf("old conn close reason = %q, want %q", got, CloseReasonReplaced)
+	}
+	if subs := h.TopicSubscribers("room"); len(subs) != 0 {
+		t.Fatalf("old conn's subscriptions should be dropped, got %v", subs)
+	}
+
+	// The old conn's readPump runs unregister late; it must be a no-op.
+	if h.unregister(c1) {
+		t.Fatal("unregister of the replaced conn must not remove the new one")
+	}
+	if h.GetConn("u1") != c2 || h.ConnCount() != 1 {
+		t.Fatal("new conn must survive the old conn's unregister")
+	}
+	if len(relay.registers) != 2 || len(relay.unregisters) != 0 {
+		t.Fatalf("relay registers=%v unregisters=%v, want 2 and 0", relay.registers, relay.unregisters)
 	}
 }
 
@@ -728,9 +816,9 @@ func TestHub_Concurrent_BroadcastSubscribeDisconnect(t *testing.T) {
 
 	wg.Wait()
 
-	// Final invariant: TopicCount and ConnCount must be internally consistent.
-	if h.ConnCount() < 0 {
-		t.Fatalf("negative ConnCount: %d", h.ConnCount())
+	// Every conn was registered once and a third of them unregistered once.
+	if want := numConns - numConns/3; h.ConnCount() != want {
+		t.Fatalf("ConnCount = %d, want %d", h.ConnCount(), want)
 	}
 }
 
@@ -1012,7 +1100,7 @@ func benchmarkBroadcast(b *testing.B, n int, shardSize int) {
 	ctx := context.Background()
 
 	for i := 0; i < n; i++ {
-		// Use fmt.Sprintf for unique IDs even at 10K+ scale.
+		// Mixed-radix ID: unique for i < 26*10*26*26.
 		id := "b" + string(rune('A'+i%26)) + string(rune('0'+(i/26)%10)) + string(rune('a'+(i/260)%26)) + string(rune('A'+(i/6760)%26))
 		c := testConn(id)
 		c.hub = h
