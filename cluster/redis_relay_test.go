@@ -87,6 +87,17 @@ func (s *mockPendingStore) PushEnvelope(_ context.Context, connID string, msg co
 	return nil
 }
 
+func (s *mockPendingStore) PushFront(_ context.Context, connID string, msgs []core.PendingMessage) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	front := make([][]byte, 0, len(msgs)+len(s.items[connID]))
+	for _, m := range msgs {
+		front = append(front, m.Data)
+	}
+	s.items[connID] = append(front, s.items[connID]...)
+	return nil
+}
+
 func (s *mockPendingStore) PopAll(_ context.Context, connID string) ([]core.PendingMessage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -358,15 +369,15 @@ func TestOnSubscribe_OnUnsubscribe_TopicSets(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	topicKey := "ws:topic:events"
+	topicKey := "ws:topicz:events"
 
 	// First subscriber on this node adds node to topic set.
 	if err := relay.OnSubscribe(ctx, "conn-1", "events"); err != nil {
 		t.Fatalf("OnSubscribe conn-1: %v", err)
 	}
-	members, err := client.SMembers(ctx, topicKey).Result()
+	members, err := client.ZRange(ctx, topicKey, 0, -1).Result()
 	if err != nil {
-		t.Fatalf("SMembers: %v", err)
+		t.Fatalf("ZRange: %v", err)
 	}
 	if len(members) != 1 || members[0] != relay.nodeID {
 		t.Errorf("expected topic set to contain nodeID, got %v", members)
@@ -376,7 +387,7 @@ func TestOnSubscribe_OnUnsubscribe_TopicSets(t *testing.T) {
 	if err := relay.OnSubscribe(ctx, "conn-2", "events"); err != nil {
 		t.Fatalf("OnSubscribe conn-2: %v", err)
 	}
-	members, _ = client.SMembers(ctx, topicKey).Result()
+	members, _ = client.ZRange(ctx, topicKey, 0, -1).Result()
 	if len(members) != 1 {
 		t.Errorf("expected 1 member in topic set, got %d", len(members))
 	}
@@ -385,7 +396,7 @@ func TestOnSubscribe_OnUnsubscribe_TopicSets(t *testing.T) {
 	if err := relay.OnUnsubscribe(ctx, "conn-1", "events", false); err != nil {
 		t.Fatalf("OnUnsubscribe conn-1: %v", err)
 	}
-	members, _ = client.SMembers(ctx, topicKey).Result()
+	members, _ = client.ZRange(ctx, topicKey, 0, -1).Result()
 	if len(members) != 1 {
 		t.Errorf("expected 1 member after non-last unsub, got %d", len(members))
 	}
@@ -394,7 +405,7 @@ func TestOnSubscribe_OnUnsubscribe_TopicSets(t *testing.T) {
 	if err := relay.OnUnsubscribe(ctx, "conn-2", "events", true); err != nil {
 		t.Fatalf("OnUnsubscribe conn-2: %v", err)
 	}
-	members, _ = client.SMembers(ctx, topicKey).Result()
+	members, _ = client.ZRange(ctx, topicKey, 0, -1).Result()
 	if len(members) != 0 {
 		t.Errorf("expected empty topic set after last unsub, got %v", members)
 	}
@@ -467,8 +478,12 @@ func TestStop_CleansUpRedisKeys(t *testing.T) {
 		t.Error("conn-y key should be deleted after Stop")
 	}
 
-	topicKey := "ws:topic:topic-1"
-	members, _ := client.SMembers(ctx, topicKey).Result()
+	topicKey := "ws:topicz:topic-1"
+	if exists, _ := client.Exists(ctx, topicKey).Result(); exists != 0 {
+		// Only member was this node, so ZREM leaves an empty (deleted) key.
+		t.Error("topic key should be gone after Stop")
+	}
+	members, _ := client.ZRange(ctx, topicKey, 0, -1).Result()
 	for _, m := range members {
 		if m == nodeID {
 			t.Error("nodeID should be removed from topic set after Stop")

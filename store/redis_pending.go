@@ -53,6 +53,25 @@ end
 return 1
 `)
 
+// pushFrontScript puts popped-but-unsent messages back at the head of the list,
+// preserving their order: ARGV[3..n] are LPUSHed in reverse so ARGV[3] ends up
+// first. A drain that fails half-way therefore leaves the buffer exactly as it
+// would have been had it never popped, instead of appending the older messages
+// behind ones buffered meanwhile (which is what RPUSH did).
+//
+// Trimming and TTL follow pushScript: keep the newest ARGV[1] entries, install
+// ARGV[2] seconds of TTL only when the key has none.
+var pushFrontScript = redis.NewScript(`
+for i = #ARGV, 3, -1 do
+	redis.call('LPUSH', KEYS[1], ARGV[i])
+end
+redis.call('LTRIM', KEYS[1], -tonumber(ARGV[1]), -1)
+if redis.call('TTL', KEYS[1]) == -1 then
+	redis.call('EXPIRE', KEYS[1], ARGV[2])
+end
+return 1
+`)
+
 // ── Options ─────────────────────────────────────────────────────────────────
 
 // Option configures a RedisPendingStore.
@@ -123,6 +142,20 @@ func (s *RedisPendingStore) PushEnvelope(ctx context.Context, connID string, msg
 	encoded := encode(msg)
 	ttlSeconds := int(jitterTTL(s.ttl).Seconds())
 	return pushScript.Run(ctx, s.client, []string{key}, encoded, s.maxMessages, ttlSeconds).Err()
+}
+
+// PushFront puts msgs back at the head of connID's list, in order, in one
+// round-trip. See pushFrontScript.
+func (s *RedisPendingStore) PushFront(ctx context.Context, connID string, msgs []core.PendingMessage) error {
+	if len(msgs) == 0 {
+		return nil
+	}
+	args := make([]interface{}, 0, len(msgs)+2)
+	args = append(args, s.maxMessages, int(jitterTTL(s.ttl).Seconds()))
+	for _, m := range msgs {
+		args = append(args, encode(m))
+	}
+	return pushFrontScript.Run(ctx, s.client, []string{s.key(connID)}, args...).Err()
 }
 
 // PopAll atomically retrieves and removes all pending messages for a connection.

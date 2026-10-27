@@ -254,6 +254,8 @@ type PendingStore interface {
     Push(ctx context.Context, connID string, data []byte) error
     // PushEnvelope stores a message with explicit type (text or binary).
     PushEnvelope(ctx context.Context, connID string, msg PendingMessage) error
+    // PushFront puts popped-but-unsent messages back at the head, in order.
+    PushFront(ctx context.Context, connID string, msgs []PendingMessage) error
     // PopAll atomically retrieves and removes all pending messages.
     PopAll(ctx context.Context, connID string) ([]PendingMessage, error)
 }
@@ -395,10 +397,12 @@ server := ws.NewServer(handler,
 
 ### How it works
 
-- **Cross-node Send**: Hub.Send looks up `ws:conn:{connID}` → target nodeID, writes to `ws:stream:{nodeID}` via Redis Streams (XADD/XREADGROUP). Falls back to PendingStore if target node is dead.
-- **Cross-node Broadcast**: Hub.Broadcast reads `ws:topic:{topic}` Set to find nodes with subscribers, then writes to each node's stream (targeted, not global fan-out).
-- **Connection registry**: Each connection registered as `ws:conn:{connID}` String with TTL, auto-renewed by heartbeat goroutine.
+- **Cross-node Send**: Hub.Send looks up `ws:conn:{connID}` → target nodeID, writes to `ws:stream:{nodeID}` via Redis Streams (XADD NOMKSTREAM / XREADGROUP). Falls back to PendingStore if target node is dead.
+- **Cross-node Broadcast**: Hub.Broadcast reads the `ws:topicz:{topic}` ZSET (member = nodeID, score = last heartbeat on the Redis server clock) for nodes refreshed within NodeTTL, then writes to their streams in one pipeline (targeted, not global fan-out).
+- **Dead-node cleanup**: no keyspace SCAN. Each node's heartbeat re-scores its topics and prunes members older than NodeTTL in the same Lua call; a topic whose members are all dead expires via TopicTTL. Scores come from `redis.call('TIME')`, so application clock skew can't evict live nodes.
+- **Connection registry**: Each connection registered as `ws:conn:{connID}` String with TTL, renewed by the heartbeat only while it still names this node; unregister deletes it compare-and-set.
 - **Node alive**: Each node maintains `ws:node:alive:{nodeID}` with TTL. Dead nodes' connections auto-expire.
+- **Requirements**: Redis ≥ 6.2 (`XADD NOMKSTREAM`). Every script touches a single key, so Redis Cluster is supported.
 
 ## Known Limitations
 

@@ -113,6 +113,10 @@ type PendingStore interface {
 	Push(ctx context.Context, connID string, data []byte) error
 	// PushEnvelope stores a message with explicit type for an offline connection.
 	PushEnvelope(ctx context.Context, connID string, msg PendingMessage) error
+	// PushFront puts msgs back at the head of connID's buffer, preserving their
+	// order. Used to return messages that were popped but could not be written,
+	// so they are not reordered behind messages buffered in the meantime.
+	PushFront(ctx context.Context, connID string, msgs []PendingMessage) error
 	// PopAll atomically retrieves and removes all pending messages for a connection.
 	PopAll(ctx context.Context, connID string) ([]PendingMessage, error)
 }

@@ -580,20 +580,15 @@ func (s *Server) drainOverflow(ctx context.Context, c *Conn) {
 			}
 			env := MessageEnvelope{Data: m.Data, MsgType: msgType}
 			if err := c.WriteEnvelope(ctx, env, s.opts.writeTimeout); err != nil {
-				// Write failed — re-push remaining messages back to PendingStore
-				// and re-signal so we retry once the next writer turn comes.
-				rePushed := true
-				for _, remaining := range msgs[i:] {
-					if pushErr := s.hub.pendingStore.PushEnvelope(ctx, c.ID(), remaining); pushErr != nil {
-						s.hub.logger.Error("drainOverflow: re-push failed", "connID", c.ID(), "error", pushErr)
-						s.metrics.IncDrops()
-						rePushed = false
-						break
-					}
+				// Write failed — put the unsent messages back at the head of the
+				// buffer (ahead of anything pushed while we were writing) and
+				// re-signal so we retry once the next writer turn comes.
+				if pushErr := s.hub.pendingStore.PushFront(ctx, c.ID(), msgs[i:]); pushErr != nil {
+					s.hub.logger.Error("drainOverflow: re-push failed", "connID", c.ID(), "error", pushErr)
+					s.metrics.IncDrops()
+					return
 				}
-				if rePushed {
-					c.signalOverflow()
-				}
+				c.signalOverflow()
 				return
 			}
 			s.metrics.IncMessagesOut()

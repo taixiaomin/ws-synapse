@@ -186,3 +186,67 @@ func TestTTL_ExpiresMessages(t *testing.T) {
 		t.Fatalf("got %v after TTL, want nil", msgs)
 	}
 }
+
+// PushFront must return popped messages to the head, in their original order,
+// ahead of anything pushed after the pop — not behind it, as RPUSH did.
+func TestPushFront_PreservesOrderAheadOfNewerMessages(t *testing.T) {
+	s, _ := setup(t)
+	ctx := context.Background()
+
+	for _, m := range []string{"m1", "m2", "m3"} {
+		if err := s.Push(ctx, "c1", []byte(m)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	popped, err := s.PopAll(ctx, "c1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// m1 was written; m2, m3 failed. Meanwhile m4 arrived.
+	if err := s.Push(ctx, "c1", []byte("m4")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PushFront(ctx, "c1", popped[1:]); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.PopAll(ctx, "c1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"m2", "m3", "m4"}
+	if len(got) != len(want) {
+		t.Fatalf("got %d messages, want %d", len(got), len(want))
+	}
+	for i, w := range want {
+		if string(got[i].Data) != w {
+			t.Fatalf("message %d = %q, want %q (full: %q)", i, got[i].Data, w, got)
+		}
+	}
+}
+
+// PushFront keeps the type prefix, honours the cap and installs a TTL on a
+// fresh key.
+func TestPushFront_TypeCapAndTTL(t *testing.T) {
+	s, mr := setup(t, WithMaxMessages(2), WithTTL(time.Minute))
+	ctx := context.Background()
+
+	msgs := []core.PendingMessage{
+		{Data: []byte("a"), MsgType: core.MsgTypeText},
+		{Data: []byte("b"), MsgType: core.MsgTypeBinary},
+		{Data: []byte("c"), MsgType: core.MsgTypeText},
+	}
+	if err := s.PushFront(ctx, "c1", msgs); err != nil {
+		t.Fatal(err)
+	}
+	if ttl := mr.TTL(DefaultKeyPrefix + "c1"); ttl <= 0 {
+		t.Fatalf("expected a TTL on a fresh key, got %v", ttl)
+	}
+	got, err := s.PopAll(ctx, "c1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || string(got[0].Data) != "b" || got[0].MsgType != core.MsgTypeBinary || string(got[1].Data) != "c" {
+		t.Fatalf("got %+v, want newest two [b(binary) c]", got)
+	}
+}

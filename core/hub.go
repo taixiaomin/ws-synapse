@@ -1014,12 +1014,9 @@ func (h *Hub) flushPending(ctx context.Context, c *Conn) {
 		}
 		if !ok {
 			h.logger.Warn("flushPending: channel full, re-buffering remaining", "connID", c.id, "remaining", len(msgs)-i)
-			for _, remaining := range msgs[i:] {
-				if pushErr := h.pendingStore.PushEnvelope(ctx, c.id, remaining); pushErr != nil {
-					h.logger.Error("flushPending: re-push failed, dropping remaining messages",
-						"connID", c.id, "error", pushErr, "dropped", len(msgs)-i)
-					return
-				}
+			if pushErr := h.pendingStore.PushFront(ctx, c.id, msgs[i:]); pushErr != nil {
+				h.logger.Error("flushPending: re-push failed, dropping remaining messages",
+					"connID", c.id, "error", pushErr, "dropped", len(msgs)-i)
 			}
 			return
 		}

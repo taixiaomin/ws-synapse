@@ -28,6 +28,13 @@ func (s *memPendingStore) PushEnvelope(_ context.Context, connID string, msg Pen
 	return nil
 }
 
+func (s *memPendingStore) PushFront(_ context.Context, connID string, msgs []PendingMessage) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.data[connID] = append(append([]PendingMessage(nil), msgs...), s.data[connID]...)
+	return nil
+}
+
 func (s *memPendingStore) PopAll(_ context.Context, connID string) ([]PendingMessage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
