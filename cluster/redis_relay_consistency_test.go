@@ -2,6 +2,8 @@ package cluster
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -255,5 +257,140 @@ func TestPublishSend_MissingStream_NotRecreated(t *testing.T) {
 	}
 	if got := pending.getItems("c1"); len(got) != 1 {
 		t.Fatalf("message not buffered after stream write failed: %v", got)
+	}
+}
+
+// gatedClient blocks the first EvalSha/Eval/ZRem on gateKey until release is
+// closed, signalling entered when it starts waiting.
+type gatedClient struct {
+	redis.Cmdable
+	gateKey string
+	once    sync.Once
+	entered chan struct{}
+	release chan struct{}
+}
+
+func newGatedClient(c redis.Cmdable, key string) *gatedClient {
+	return &gatedClient{Cmdable: c, gateKey: key, entered: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (g *gatedClient) wait(keys ...string) {
+	if len(keys) == 0 || keys[0] != g.gateKey {
+		return
+	}
+	g.once.Do(func() {
+		close(g.entered)
+		<-g.release
+	})
+}
+
+func (g *gatedClient) EvalSha(ctx context.Context, sha1 string, keys []string, args ...interface{}) *redis.Cmd {
+	g.wait(keys...)
+	return g.Cmdable.EvalSha(ctx, sha1, keys, args...)
+}
+
+func (g *gatedClient) Eval(ctx context.Context, script string, keys []string, args ...interface{}) *redis.Cmd {
+	g.wait(keys...)
+	return g.Cmdable.Eval(ctx, script, keys, args...)
+}
+
+func (g *gatedClient) ZRem(ctx context.Context, key string, members ...interface{}) *redis.IntCmd {
+	g.wait(key)
+	return g.Cmdable.ZRem(ctx, key, members...)
+}
+
+func waitDone(t *testing.T, done <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("%s did not return", what)
+	}
+}
+
+// A membership write that is stuck on Redis must not block subscribes to
+// other topics that share its lock stripe.
+func TestAdjustTopic_NoRedisIOUnderStripeLock(t *testing.T) {
+	_, client := setupMiniredis(t)
+	probe := NewRedisClusterRelay(client, nil)
+	slow, other := "slow", ""
+	for i := 0; other == ""; i++ {
+		if tp := fmt.Sprintf("other-%d", i); probe.topicStripe(tp) == probe.topicStripe(slow) {
+			other = tp
+		}
+	}
+	gc := newGatedClient(client, "ws:topicz:"+slow)
+	relay := NewRedisClusterRelay(gc, nil, fastOpts()...)
+	ctx := context.Background()
+
+	slowDone := make(chan struct{})
+	go func() { _ = relay.OnSubscribe(ctx, "c1", slow); close(slowDone) }()
+	<-gc.entered
+
+	otherDone := make(chan struct{})
+	go func() { _ = relay.OnSubscribe(ctx, "c2", other); close(otherDone) }()
+	waitDone(t, otherDone, "subscribe on a sibling topic")
+
+	close(gc.release)
+	waitDone(t, slowDone, "gated subscribe")
+	if got := topicMembers(t, client, slow); len(got) != 1 {
+		t.Fatalf("%s members = %v", slow, got)
+	}
+	if got := topicMembers(t, client, other); len(got) != 1 {
+		t.Fatalf("%s members = %v", other, got)
+	}
+}
+
+// If the count drops back to zero while the join is being written, the
+// in-flight writer must follow up with a leave.
+func TestAdjustTopic_ConvergesAfterLeaveDuringJoin(t *testing.T) {
+	_, client := setupMiniredis(t)
+	gc := newGatedClient(client, "ws:topicz:t")
+	relay := NewRedisClusterRelay(gc, nil, fastOpts()...)
+	ctx := context.Background()
+
+	joinDone := make(chan struct{})
+	go func() { _ = relay.OnSubscribe(ctx, "c1", "t"); close(joinDone) }()
+	<-gc.entered
+
+	leaveDone := make(chan struct{})
+	go func() { _ = relay.OnUnsubscribe(ctx, "c1", "t", true); close(leaveDone) }()
+	waitDone(t, leaveDone, "unsubscribe while join in flight")
+
+	close(gc.release)
+	waitDone(t, joinDone, "gated subscribe")
+	if got := topicMembers(t, client, "t"); len(got) != 0 {
+		t.Fatalf("count is 0 but members = %v", got)
+	}
+	if _, busy := relay.topicStripe("t").syncing["t"]; busy {
+		t.Fatal("syncing flag not cleared")
+	}
+}
+
+// If a subscriber comes back while the leave is being written, the in-flight
+// writer must re-join.
+func TestAdjustTopic_ConvergesAfterJoinDuringLeave(t *testing.T) {
+	_, client := setupMiniredis(t)
+	relay := NewRedisClusterRelay(client, nil, fastOpts()...)
+	ctx := context.Background()
+	if err := relay.OnSubscribe(ctx, "c1", "t"); err != nil {
+		t.Fatal(err)
+	}
+	// Gate only the leave from here on.
+	gc := newGatedClient(client, "ws:topicz:t")
+	relay.client = gc
+
+	leaveDone := make(chan struct{})
+	go func() { _ = relay.OnUnsubscribe(ctx, "c1", "t", true); close(leaveDone) }()
+	<-gc.entered
+
+	joinDone := make(chan struct{})
+	go func() { _ = relay.OnSubscribe(ctx, "c2", "t"); close(joinDone) }()
+	waitDone(t, joinDone, "subscribe while leave in flight")
+
+	close(gc.release)
+	waitDone(t, leaveDone, "gated unsubscribe")
+	if got := topicMembers(t, client, "t"); len(got) != 1 || got[0] != relay.NodeID() {
+		t.Fatalf("count is 1 but members = %v", got)
 	}
 }

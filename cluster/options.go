@@ -55,12 +55,12 @@ func WithKeyPrefix(prefix string) Option {
 }
 
 // WithTopicSharedTTL sets how long PublishBroadcast may trust a cached
-// local-only/shared topic decision before refreshing via SMembers.
+// local-only/shared topic decision before re-reading topic membership.
 func WithTopicSharedTTL(d time.Duration) Option {
 	return func(r *RedisClusterRelay) { r.topicSharedTTL = d }
 }
 
-// WithTopicTTL sets the TTL for topic membership SET keys (default 3h).
+// WithTopicTTL sets the TTL for topic membership ZSET keys (default 3h).
 // Topic keys are refreshed every heartbeat interval; the TTL acts as a
 // safety net so orphan keys are cleaned up after node crashes.
 func WithTopicTTL(d time.Duration) Option {

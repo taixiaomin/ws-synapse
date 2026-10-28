@@ -53,9 +53,10 @@ type RedisClusterRelay struct {
 	// int64 (immutable, so heartbeat can read them without a lock) and may be
 	// temporarily negative; see adjustTopic. Only counts > 0 are members.
 	localTopics sync.Map // topic → int64
-	// topicLocks serialises, per topic, a count change together with the Redis
-	// write it triggers, so join/leave writes for one topic can't reorder.
-	topicLocks [64]sync.Mutex
+	// topicStripes guard localTopics count changes and track which topics have
+	// a membership write in flight; see adjustTopic. No Redis I/O happens
+	// under a stripe lock.
+	topicStripes [64]topicStripe
 
 	// aliveCache remembers recent positive node-liveness checks for
 	// PublishSend, saving an EXISTS round-trip per message.
@@ -63,7 +64,7 @@ type RedisClusterRelay struct {
 
 	// topicShared caches whether a topic has subscribers on any node other
 	// than this one. PublishBroadcast uses it as a fast path to skip the
-	// SMembers round-trip + fan-out when the topic is known to be local-only.
+	// membership read + fan-out when the topic is known to be local-only.
 	// Populated lazily by PublishBroadcast (slow path) and invalidated by
 	// pub/sub events from OnSubscribe/OnUnsubscribe on other nodes.
 	//
@@ -101,6 +102,14 @@ const (
 type topicSharedCacheEntry struct {
 	shared    bool
 	expiresAt time.Time
+}
+
+// topicStripe is one shard of the per-topic bookkeeping lock. syncing holds
+// the topics whose Redis membership write is in flight; at most one goroutine
+// writes a given topic's membership at a time.
+type topicStripe struct {
+	mu      sync.Mutex
+	syncing map[string]struct{}
 }
 
 // NewRedisClusterRelay creates a new relay. pendingStore is used as a fallback
@@ -259,58 +268,104 @@ func (r *RedisClusterRelay) OnUnsubscribe(ctx context.Context, _, topic string, 
 //     so the final count always equals the real number of local subscribers.
 //     (The old code returned early on a missing entry, leaking a +1 and
 //     keeping this node in the topic forever.)
-//   - The count change and its ZADD/ZREM happen under the same per-topic lock,
-//     so a leave's ZREM can no longer land after a later join's ZADD and drop
-//     this node from a topic it still serves.
+//   - At most one goroutine writes a topic's membership at a time (the
+//     stripe's syncing set), and it re-reads the count after each write until
+//     Redis matches it. A leave's ZREM therefore can't land after a later
+//     join's ZADD and drop this node from a topic it still serves.
 //
-// Holding the lock across a Redis round-trip is acceptable: only this topic's
-// stripe waits, and only on 0↔1 transitions; the hot path (broadcast) never
-// takes it. The client's read/write timeouts bound the wait.
+// The stripe lock only covers the count change and the syncing check, never a
+// Redis round-trip, so a slow Redis can't make subscribes on other topics in
+// the same stripe queue behind this one. Only the caller that starts a write
+// waits for it.
 func (r *RedisClusterRelay) adjustTopic(ctx context.Context, topic string, delta int64) error {
-	mu := r.topicLock(topic)
-	mu.Lock()
-	defer mu.Unlock()
-
-	var old int64
-	if v, ok := r.localTopics.Load(topic); ok {
-		old = v.(int64)
-	}
+	s := r.topicStripe(topic)
+	s.mu.Lock()
+	old := r.localCount(topic)
 	cur := old + delta
 	if cur == 0 {
 		r.localTopics.Delete(topic)
 	} else {
 		r.localTopics.Store(topic, cur)
 	}
+	if (old > 0) == (cur > 0) {
+		s.mu.Unlock()
+		return nil // membership unchanged
+	}
+	if _, busy := s.syncing[topic]; busy {
+		s.mu.Unlock()
+		return nil // the in-flight writer converges to the new count
+	}
+	if s.syncing == nil {
+		s.syncing = make(map[string]struct{})
+	}
+	s.syncing[topic] = struct{}{}
+	s.mu.Unlock()
 
+	return r.syncTopic(ctx, topic, cur > 0)
+}
+
+// syncTopic writes this node's membership of topic (join) or its removal
+// (leave) without holding the stripe lock, then repeats while the local count
+// has flipped in the meantime. The caller must have marked topic as syncing.
+//
+// On a failed write it stops instead of retrying against a failing Redis; the
+// state self-heals: a missing join is re-added by the next heartbeat while the
+// count is > 0, and a leftover member is no longer refreshed, so it drops out
+// of reads after nodeTTL and is pruned by live members' heartbeats.
+func (r *RedisClusterRelay) syncTopic(ctx context.Context, topic string, join bool) error {
+	s := r.topicStripe(topic)
 	key := r.topicKey(topic)
-	switch {
-	case old <= 0 && cur > 0: // join
-		if err := topicTouchScript.Run(ctx, r.client, []string{key},
-			r.nodeID, r.nodeTTL.Milliseconds(), r.topicTTLMillis()).Err(); err != nil {
-			// localTopics already counts it; the next heartbeat re-joins.
-			return err
+	joined := false
+	var err error
+	for {
+		if join {
+			err = topicTouchScript.Run(ctx, r.client, []string{key},
+				r.nodeID, r.nodeTTL.Milliseconds(), r.topicTTLMillis()).Err()
+			joined = joined || err == nil
+		} else {
+			// No "-" event: a peer caching shared=true for this topic takes
+			// the slow path on every broadcast anyway, so invalidating it buys
+			// nothing, while in Redis Cluster every PUBLISH is fanned out to
+			// all shards.
+			r.topicShared.Delete(topic)
+			err = r.client.ZRem(ctx, key, r.nodeID).Err()
 		}
+
+		s.mu.Lock()
+		want := r.localCount(topic) > 0
+		if err != nil || want == join {
+			delete(s.syncing, topic)
+			s.mu.Unlock()
+			break
+		}
+		s.mu.Unlock()
+		join = want
+	}
+
+	if joined {
 		// Tell other nodes their topicShared cache for this topic is stale —
 		// we just joined as a (possibly new) remote node from their POV.
 		// Best-effort: a dropped PUBLISH only delays correctness by the next
 		// natural cache refresh, it doesn't corrupt anything.
-		if err := r.client.Publish(ctx, r.membershipChannel(), membershipMsgAdd+topic).Err(); err != nil {
-			r.logger.Warn("relay: membership publish (add) failed", "topic", topic, "error", err)
+		if pubErr := r.client.Publish(ctx, r.membershipChannel(), membershipMsgAdd+topic).Err(); pubErr != nil {
+			r.logger.Warn("relay: membership publish (add) failed", "topic", topic, "error", pubErr)
 		}
-	case old > 0 && cur <= 0: // leave
-		// No "-" event: a peer caching shared=true for this topic takes the
-		// slow path on every broadcast anyway, so invalidating it buys nothing,
-		// while in Redis Cluster every PUBLISH is fanned out to all shards.
-		r.topicShared.Delete(topic)
-		return r.client.ZRem(ctx, key, r.nodeID).Err()
 	}
-	return nil
+	return err
 }
 
-func (r *RedisClusterRelay) topicLock(topic string) *sync.Mutex {
+func (r *RedisClusterRelay) topicStripe(topic string) *topicStripe {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(topic))
-	return &r.topicLocks[h.Sum32()%uint32(len(r.topicLocks))]
+	return &r.topicStripes[h.Sum32()%uint32(len(r.topicStripes))]
+}
+
+// localCount returns this node's subscriber count for topic (may be negative).
+func (r *RedisClusterRelay) localCount(topic string) int64 {
+	if v, ok := r.localTopics.Load(topic); ok {
+		return v.(int64)
+	}
+	return 0
 }
 
 func (r *RedisClusterRelay) topicTTLMillis() int64 {
@@ -613,6 +668,10 @@ func (r *RedisClusterRelay) consumeLoop() {
 // A leave racing with this refresh can re-add this node after OnUnsubscribe
 // removed it; the stray member is no longer refreshed, ages out of reads after
 // nodeTTL and is pruned by the next live member's heartbeat.
+//
+// Topics are refreshed before connections: a membership is only valid for
+// nodeTTL while a route lasts connTTL (longer), so if a slow Redis makes the
+// heartbeat run out of time, the batches that are cut are the cheaper ones.
 func (r *RedisClusterRelay) refreshRegistrations(ctx context.Context) {
 	connTTL := r.connTTL.Milliseconds()
 	nodeTTL := r.nodeTTL.Milliseconds()
@@ -631,20 +690,20 @@ func (r *RedisClusterRelay) refreshRegistrations(ctx context.Context) {
 		calls = calls[:0]
 	}
 
-	r.localConns.Range(func(key, _ any) bool {
-		calls = append(calls, &scriptCall{script: connRefreshScript,
-			keys: []string{r.connKey(key.(string))}, args: []interface{}{r.nodeID, connTTL}})
-		if len(calls) >= heartbeatBatch {
-			flush()
-		}
-		return true
-	})
 	r.localTopics.Range(func(key, val any) bool {
 		if val.(int64) <= 0 {
 			return true
 		}
 		calls = append(calls, &scriptCall{script: topicTouchScript,
 			keys: []string{r.topicKey(key.(string))}, args: []interface{}{r.nodeID, nodeTTL, r.topicTTLMillis()}})
+		if len(calls) >= heartbeatBatch {
+			flush()
+		}
+		return true
+	})
+	r.localConns.Range(func(key, _ any) bool {
+		calls = append(calls, &scriptCall{script: connRefreshScript,
+			keys: []string{r.connKey(key.(string))}, args: []interface{}{r.nodeID, connTTL}})
 		if len(calls) >= heartbeatBatch {
 			flush()
 		}
@@ -824,6 +883,7 @@ func (r *RedisClusterRelay) topicKey(topic string) string {
 //
 //	"+<topic>"  — sender just became the first local subscriber for <topic>
 //	"-<topic>"  — sender just dropped the last local subscriber for <topic>
+//	              (sent only by older versions; still accepted)
 //
 // Receivers invalidate their topicShared cache for <topic>. Using one
 // channel for everything keeps the Redis subscriber count bounded at 1
@@ -859,7 +919,7 @@ func (r *RedisClusterRelay) membershipChangeLoop() {
 			}
 			// Skip our own publishes — we already know the cache is fresh
 			// (we just touched the set), so invalidating would just cause
-			// the next broadcast to do a wasted SMembers.
+			// the next broadcast to do a wasted membership read.
 			//
 			// However the protocol doesn't carry the sender, so we use a
 			// conservative heuristic: only invalidate if the cached state
